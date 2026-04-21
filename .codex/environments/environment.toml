@@ -4,3 +4,18 @@ name = "Velocity"
 
 [setup]
 script = ""
+
+[[actions]]
+name = "Run"
+icon = "run"
+command = "cargo run"
+
+[[actions]]
+name = "Build"
+icon = "tool"
+command = "cargo build"
+
+[[actions]]
+name = "Install"
+icon = "tool"
+command = "cargo check"
