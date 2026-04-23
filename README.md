@@ -18,17 +18,31 @@ Then restart your terminal.
 cargo run
 ```
 
+To enable the in-app `/agent` command with Groq, either add your API key to `.env.local`:
+
+```powershell
+GROQ_API_KEY=your-groq-api-key
+```
+
+or set it in the environment before launching:
+
+```powershell
+$env:GROQ_API_KEY="your-groq-api-key"
+cargo run
+```
+
 ## Build
 
 ```powershell
 cargo build --release
 ```
 
-## macOS artifacts
+## GitHub Actions artifacts
 
-GitHub Actions builds downloadable macOS release artifacts for both Intel and Apple Silicon:
+GitHub Actions builds downloadable release artifacts for macOS and Windows:
 
 - `velocity-macos-intel`
 - `velocity-macos-apple-silicon`
+- `velocity-windows`
 
-You can run the workflow from the Actions tab with `workflow_dispatch`, or let it run automatically on pushes to `main` and on pull requests.
+You can run the workflows from the Actions tab with `workflow_dispatch`, or let them run automatically on pushes to `main` and on pull requests.

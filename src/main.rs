@@ -15,6 +15,8 @@ use eframe::egui::{
     ViewportBuilder,
 };
 use eframe::egui::text::LayoutJob;
+use reqwest::blocking::Client;
+use serde::{Deserialize, Serialize};
 use shadow_terminal::{
     shadow_terminal::Config as ShadowConfig,
     steppable_terminal::{Input as TerminalInput, SteppableTerminal},
@@ -166,6 +168,15 @@ struct TerminalCursor {
 }
 
 const SEARCH_INPUT_ID: &str = "search_sidebar_input";
+const GROQ_API_URL: &str = "https://api.groq.com/openai/v1/chat/completions";
+const GROQ_MODEL: &str = "openai/gpt-oss-120b";
+const GROQ_API_KEY_ENV: &str = "GROQ_API_KEY";
+const LOCAL_ENV_FILE: &str = ".env.local";
+const AGENT_SYSTEM_PROMPT: &str = "You are an action-oriented coding agent inside a desktop app. \
+The user may want help with internet research, file edits, file deletion, and sandboxed command execution. \
+You do not have direct tool execution in this chat endpoint, so do not claim you already ran commands, browsed, or changed files unless the user pasted results. \
+When those actions would help, clearly state the exact commands, file changes, or internet lookups you would perform. \
+Format answers cleanly in Markdown, keep them practical, and prefer concrete steps over abstract advice.";
 
 enum TerminalRequest {
     RunCommand(String),
@@ -199,6 +210,11 @@ struct CommandExecutor {
     result_rx: Receiver<CommandExecutionResult>,
 }
 
+struct AgentExecutor {
+    request_tx: Sender<AgentChatRequest>,
+    result_rx: Receiver<AgentChatResult>,
+}
+
 #[derive(Clone)]
 struct CommandExecutionRequest {
     id: u64,
@@ -210,6 +226,19 @@ struct CommandExecutionRequest {
 struct CommandExecutionResult {
     id: u64,
     output: String,
+    success: bool,
+}
+
+#[derive(Clone)]
+struct AgentChatRequest {
+    id: u64,
+    prompt: String,
+}
+
+#[derive(Clone)]
+struct AgentChatResult {
+    id: u64,
+    response: String,
     success: bool,
 }
 
@@ -226,6 +255,29 @@ enum CommandBlockStatus {
     Running,
     Success,
     Error,
+}
+
+#[derive(Clone)]
+struct AgentChatBox {
+    id: u64,
+    prompt: String,
+    response: String,
+    status: AgentChatStatus,
+    created_at: Instant,
+    completed_at: Option<Instant>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AgentChatStatus {
+    Running,
+    Success,
+    Error,
+}
+
+#[derive(Clone)]
+enum TranscriptEntry {
+    Command(CommandBlock),
+    Agent(AgentChatBox),
 }
 
 impl TerminalBackend {
@@ -320,6 +372,48 @@ impl CommandExecutor {
     }
 }
 
+impl AgentExecutor {
+    fn new() -> Self {
+        let (request_tx, request_rx) = mpsc::channel::<AgentChatRequest>();
+        let (result_tx, result_rx) = mpsc::channel::<AgentChatResult>();
+
+        thread::spawn(move || {
+            while let Ok(request) = request_rx.recv() {
+                let result = execute_agent_request(&request);
+                let _ = result_tx.send(result);
+            }
+        });
+
+        Self {
+            request_tx,
+            result_rx,
+        }
+    }
+
+    fn execute(&self, request: AgentChatRequest) {
+        let _ = self.request_tx.send(request);
+    }
+
+    fn drain_results(&self, entries: &mut [TranscriptEntry]) {
+        while let Ok(result) = self.result_rx.try_recv() {
+            for entry in entries.iter_mut() {
+                if let TranscriptEntry::Agent(chat) = entry {
+                    if chat.id == result.id {
+                        chat.response = result.response.clone();
+                        chat.status = if result.success {
+                            AgentChatStatus::Success
+                        } else {
+                            AgentChatStatus::Error
+                        };
+                        chat.completed_at = Some(Instant::now());
+                        break;
+                    }
+                }
+            }
+        }
+    }
+}
+
 impl Drop for TerminalBackend {
     fn drop(&mut self) {
         let _ = self.request_tx.send(TerminalRequest::Shutdown);
@@ -339,7 +433,8 @@ struct VelocityApp {
     terminals: Vec<TerminalPane>,
     active_terminal: usize,
     command_executor: CommandExecutor,
-    command_blocks: Vec<CommandBlock>,
+    agent_executor: AgentExecutor,
+    transcript_entries: Vec<TranscriptEntry>,
     next_command_id: u64,
     input_context: InputContext,
     last_context_refresh: Instant,
@@ -376,7 +471,8 @@ impl VelocityApp {
             terminals: vec![TerminalPane::new(ctx.clone(), 0)],
             active_terminal: 0,
             command_executor: CommandExecutor::new(),
-            command_blocks: Vec::new(),
+            agent_executor: AgentExecutor::new(),
+            transcript_entries: Vec::new(),
             next_command_id: 1,
             input_context: read_input_context_for_directory(&shell_directory),
             last_context_refresh: Instant::now(),
@@ -398,6 +494,11 @@ impl VelocityApp {
             return;
         }
 
+        if self.try_handle_agent_command(&command) {
+            self.command_input.clear();
+            return;
+        }
+
         if looks_interactive_command(&command) {
             self.launch_interactive_command(&command);
             self.command_input.clear();
@@ -406,12 +507,12 @@ impl VelocityApp {
 
         let command_id = self.next_command_id;
         self.next_command_id += 1;
-        self.command_blocks.push(CommandBlock {
+        self.transcript_entries.push(TranscriptEntry::Command(CommandBlock {
             id: command_id,
             command: command.clone(),
             output: String::new(),
             status: CommandBlockStatus::Running,
-        });
+        }));
         self.command_executor.execute(CommandExecutionRequest {
             id: command_id,
             command,
@@ -579,12 +680,13 @@ impl VelocityApp {
         let Some(resolved_directory) = resolve_directory_target(&self.shell_directory, target) else {
             let command_id = self.next_command_id;
             self.next_command_id += 1;
-            self.command_blocks.push(CommandBlock {
+            self.transcript_entries
+                .push(TranscriptEntry::Command(CommandBlock {
                 id: command_id,
                 command: command.to_owned(),
                 output: format!("Directory not found: {target}"),
                 status: CommandBlockStatus::Error,
-            });
+            }));
             return true;
         };
 
@@ -599,11 +701,36 @@ impl VelocityApp {
 
         let command_id = self.next_command_id;
         self.next_command_id += 1;
-        self.command_blocks.push(CommandBlock {
+        self.transcript_entries
+            .push(TranscriptEntry::Command(CommandBlock {
             id: command_id,
             command: command.to_owned(),
             output: format!("Changed directory to {resolved_directory}"),
             status: CommandBlockStatus::Success,
+        }));
+        true
+    }
+
+    fn try_handle_agent_command(&mut self, command: &str) -> bool {
+        let Some(prompt) = parse_agent_prompt(command) else {
+            return false;
+        };
+
+        let chat_id = self.next_command_id;
+        self.next_command_id += 1;
+        let prompt = prompt.to_owned();
+        self.transcript_entries
+            .push(TranscriptEntry::Agent(AgentChatBox {
+                id: chat_id,
+                prompt: prompt.clone(),
+                response: String::new(),
+                status: AgentChatStatus::Running,
+                created_at: Instant::now(),
+                completed_at: None,
+            }));
+        self.agent_executor.execute(AgentChatRequest {
+            id: chat_id,
+            prompt,
         });
         true
     }
@@ -744,7 +871,8 @@ impl eframe::App for VelocityApp {
         for pane in &mut self.terminals {
             pane.backend.drain_updates(&mut pane.snapshot);
         }
-        self.command_executor.drain_results(&mut self.command_blocks);
+        drain_command_results(&self.command_executor, &mut self.transcript_entries);
+        self.agent_executor.drain_results(&mut self.transcript_entries);
         let terminal_changed = self
             .terminals
             .iter()
@@ -840,13 +968,13 @@ impl eframe::App for VelocityApp {
                                     ui.spacing_mut().item_spacing = Vec2::ZERO;
                                     let estimated_block_height = 86.0;
                                     let bottom_padding = (transcript_height
-                                        - self.command_blocks.len() as f32 * estimated_block_height)
+                                        - self.transcript_entries.len() as f32 * estimated_block_height)
                                         .max(0.0);
                                     if bottom_padding > 0.0 {
                                         ui.add_space(bottom_padding);
                                     }
-                                    for block in &self.command_blocks {
-                                        command_block_card(ui, block);
+                                    for entry in &self.transcript_entries {
+                                        transcript_entry_card(ui, entry);
                                     }
                                 });
                         },
@@ -881,6 +1009,11 @@ impl eframe::App for VelocityApp {
                                 &self.available_commands,
                                 &self.shell_directory,
                             );
+                            let mut layouter = |ui: &egui::Ui, text: &dyn TextBuffer, wrap_width: f32| {
+                                let mut job = command_input_layout_job(text.as_str());
+                                job.wrap.max_width = wrap_width;
+                                ui.ctx().fonts_mut(|fonts| fonts.layout_job(job))
+                            };
                             let input_response = ui.add_sized(
                                 [ui.available_width(), 24.0],
                                 TextEdit::singleline(&mut self.command_input)
@@ -891,6 +1024,7 @@ impl eframe::App for VelocityApp {
                                     .background_color(Color32::TRANSPARENT)
                                     .text_color(color(245, 246, 248))
                                     .margin(Vec2::new(0.0, 2.0))
+                                    .layouter(&mut layouter)
                                     .frame(Frame::NONE),
                             );
                             if self.refocus_command_input {
@@ -1022,6 +1156,12 @@ impl eframe::App for VelocityApp {
                                     )
                                 });
                                 let input_response = if let Some(pane) = self.terminals.get_mut(index) {
+                                    let mut layouter =
+                                        |ui: &egui::Ui, text: &dyn TextBuffer, wrap_width: f32| {
+                                            let mut job = command_input_layout_job(text.as_str());
+                                            job.wrap.max_width = wrap_width;
+                                            ui.ctx().fonts_mut(|fonts| fonts.layout_job(job))
+                                        };
                                     ui.add_sized(
                                         [ui.available_width(), 28.0],
                                         TextEdit::singleline(&mut pane.command_input)
@@ -1031,6 +1171,7 @@ impl eframe::App for VelocityApp {
                                             .background_color(Color32::TRANSPARENT)
                                             .text_color(color(245, 246, 248))
                                             .margin(Vec2::new(0.0, 4.0))
+                                            .layouter(&mut layouter)
                                             .frame(Frame::NONE),
                                     )
                                 } else {
@@ -2052,6 +2193,39 @@ fn paint_command_suggestion(
     );
 }
 
+fn command_input_layout_job(text: &str) -> LayoutJob {
+    let mut job = LayoutJob::default();
+    let base = TextFormat {
+        font_id: FontId::new(14.0, FontFamily::Monospace),
+        color: color(245, 246, 248),
+        ..Default::default()
+    };
+    let agent_chip = TextFormat {
+        font_id: FontId::new(14.0, FontFamily::Monospace),
+        color: color(255, 214, 102),
+        background: color(39, 31, 12),
+        ..Default::default()
+    };
+
+    if let Some(rest) = text.strip_prefix("/agent") {
+        job.append("/agent", 0.0, agent_chip);
+        if !rest.is_empty() {
+            job.append(rest, 0.0, base);
+        }
+    } else {
+        job.append(text, 0.0, base);
+    }
+
+    job
+}
+
+fn transcript_entry_card(ui: &mut egui::Ui, entry: &TranscriptEntry) {
+    match entry {
+        TranscriptEntry::Command(block) => command_block_card(ui, block),
+        TranscriptEntry::Agent(chat) => agent_chat_box_card(ui, chat),
+    }
+}
+
 fn command_block_card(ui: &mut egui::Ui, block: &CommandBlock) {
     let available_width = ui.available_width();
     ui.allocate_ui_with_layout(
@@ -2083,6 +2257,621 @@ fn command_block_card(ui: &mut egui::Ui, block: &CommandBlock) {
                 });
         },
     );
+}
+
+fn agent_chat_box_card(ui: &mut egui::Ui, chat: &AgentChatBox) {
+    let available_width = ui.available_width();
+    ui.allocate_ui_with_layout(
+        Vec2::new(available_width, 0.0),
+        egui::Layout::top_down(egui::Align::Min),
+        |ui| {
+            Frame::new()
+                .fill(color(20, 21, 24))
+                .corner_radius(CornerRadius::ZERO)
+                .inner_margin(Margin::same(12))
+                .stroke(Stroke::new(1.0, color(44, 47, 54)))
+                .show(ui, |ui| {
+                    ui.set_min_width(available_width - 2.0);
+                    ui.horizontal_wrapped(|ui| {
+                        Frame::new()
+                            .fill(color(39, 31, 12))
+                            .corner_radius(CornerRadius::ZERO)
+                            .inner_margin(Margin::symmetric(6, 2))
+                            .stroke(Stroke::new(1.0, color(93, 76, 28)))
+                            .show(ui, |ui| {
+                                ui.label(
+                                    RichText::new("/agent")
+                                        .family(FontFamily::Monospace)
+                                        .size(12.0)
+                                        .color(color(255, 208, 102)),
+                                );
+                            });
+                        if !chat.prompt.trim().is_empty() {
+                            ui.add_space(8.0);
+                            ui.label(
+                                RichText::new(&chat.prompt)
+                                    .family(FontFamily::Monospace)
+                                    .size(13.0)
+                                    .color(color(242, 244, 247)),
+                            );
+                        }
+                    });
+                    ui.add_space(8.0);
+                    render_agent_chat_output(ui, chat);
+                });
+        },
+    );
+}
+
+fn render_agent_chat_output(ui: &mut egui::Ui, chat: &AgentChatBox) {
+    match chat.status {
+        AgentChatStatus::Running => {
+            let dots = ((chat.created_at.elapsed().as_millis() / 400) % 4) as usize;
+            let thinking = format!("Thinking{}", ".".repeat(dots));
+            ui.ctx().request_repaint_after(Duration::from_millis(120));
+            ui.label(
+                RichText::new(thinking)
+                    .family(FontFamily::Monospace)
+                    .size(12.0)
+                    .color(color(255, 208, 102)),
+            );
+        }
+        AgentChatStatus::Success | AgentChatStatus::Error => {
+            let full_text = &chat.response;
+            let visible_chars = typewriter_visible_chars(chat, full_text);
+            let visible_text = prefix_chars(full_text, visible_chars);
+            if visible_chars < full_text.chars().count() {
+                ui.ctx().request_repaint_after(Duration::from_millis(16));
+            }
+            render_ai_markdown(
+                ui,
+                &visible_text,
+                chat.status == AgentChatStatus::Error,
+            );
+        }
+    }
+}
+
+fn typewriter_visible_chars(chat: &AgentChatBox, text: &str) -> usize {
+    let total = text.chars().count();
+    let Some(completed_at) = chat.completed_at else {
+        return 0;
+    };
+    let chars_per_second = 90.0;
+    let elapsed = completed_at.elapsed().as_secs_f32();
+    let visible = (elapsed * chars_per_second).ceil() as usize;
+    visible.min(total)
+}
+
+fn prefix_chars(text: &str, count: usize) -> String {
+    text.chars().take(count).collect()
+}
+
+fn render_ai_markdown(ui: &mut egui::Ui, text: &str, is_error: bool) {
+    let base_color = if is_error {
+        color(255, 128, 128)
+    } else {
+        color(215, 217, 222)
+    };
+    let heading_color = if is_error {
+        color(255, 160, 160)
+    } else {
+        color(242, 244, 247)
+    };
+    let bullet_color = if is_error {
+        color(255, 145, 145)
+    } else {
+        color(132, 208, 255)
+    };
+    let code_bg = if is_error {
+        color(38, 18, 18)
+    } else {
+        color(12, 13, 16)
+    };
+
+    let mut in_code_block = false;
+    let mut code_lines: Vec<String> = Vec::new();
+    let mut paragraph_lines: Vec<String> = Vec::new();
+
+    for line in text.lines() {
+        let trimmed = line.trim_end();
+        if trimmed.starts_with("```") {
+            if !paragraph_lines.is_empty() {
+                render_markdown_paragraph(ui, &paragraph_lines, base_color, code_bg, is_error);
+                paragraph_lines.clear();
+            }
+            if in_code_block {
+                render_code_block(ui, &code_lines.join("\n"), base_color, code_bg);
+                code_lines.clear();
+                in_code_block = false;
+            } else {
+                in_code_block = true;
+            }
+            continue;
+        }
+
+        if in_code_block {
+            code_lines.push(trimmed.to_owned());
+            continue;
+        }
+
+        if trimmed.is_empty() {
+            if !paragraph_lines.is_empty() {
+                render_markdown_paragraph(ui, &paragraph_lines, base_color, code_bg, is_error);
+                paragraph_lines.clear();
+            }
+            ui.add_space(4.0);
+            continue;
+        }
+
+        if let Some((level, heading)) = parse_markdown_heading(trimmed) {
+            if !paragraph_lines.is_empty() {
+                render_markdown_paragraph(ui, &paragraph_lines, base_color, code_bg, is_error);
+                paragraph_lines.clear();
+            }
+            let size = match level {
+                1 => 18.0,
+                2 => 15.0,
+                _ => 13.0,
+            };
+            ui.add(
+                egui::Label::new(inline_markdown_job(
+                    heading,
+                    heading_color,
+                    code_bg,
+                    true,
+                    size,
+                    is_error,
+                ))
+                .wrap(),
+            );
+            continue;
+        }
+
+        if is_markdown_rule(trimmed) {
+            if !paragraph_lines.is_empty() {
+                render_markdown_paragraph(ui, &paragraph_lines, base_color, code_bg, is_error);
+                paragraph_lines.clear();
+            }
+            let width = ui.available_width();
+            let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 8.0), egui::Sense::hover());
+            let y = rect.center().y;
+            ui.painter().line_segment(
+                [egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)],
+                Stroke::new(1.0, color(44, 47, 54)),
+            );
+            continue;
+        }
+
+        if let Some((marker, item)) = parse_markdown_list_item_ascii(trimmed) {
+            if !paragraph_lines.is_empty() {
+                render_markdown_paragraph(ui, &paragraph_lines, base_color, code_bg, is_error);
+                paragraph_lines.clear();
+            }
+            ui.horizontal_wrapped(|ui| {
+                ui.add_sized(
+                    [18.0, 0.0],
+                    egui::Label::new(
+                        RichText::new(marker)
+                            .family(FontFamily::Monospace)
+                            .size(12.0)
+                            .color(bullet_color),
+                    ),
+                );
+                ui.add(
+                    egui::Label::new(inline_markdown_job(
+                        item,
+                        base_color,
+                        code_bg,
+                        false,
+                        12.0,
+                        is_error,
+                    ))
+                    .wrap(),
+                );
+            });
+            continue;
+        }
+
+        if let Some(quote) = trimmed.strip_prefix("> ") {
+            if !paragraph_lines.is_empty() {
+                render_markdown_paragraph(ui, &paragraph_lines, base_color, code_bg, is_error);
+                paragraph_lines.clear();
+            }
+            Frame::new()
+                .fill(color(18, 19, 22))
+                .inner_margin(Margin::symmetric(10, 8))
+                .stroke(Stroke::new(1.0, color(44, 47, 54)))
+                .show(ui, |ui| {
+                    ui.add(
+                        egui::Label::new(inline_markdown_job(
+                            quote,
+                            base_color,
+                            code_bg,
+                            false,
+                            12.0,
+                            is_error,
+                        ))
+                        .wrap(),
+                    );
+                });
+            continue;
+        }
+
+        paragraph_lines.push(trimmed.to_owned());
+    }
+
+    if !paragraph_lines.is_empty() {
+        render_markdown_paragraph(ui, &paragraph_lines, base_color, code_bg, is_error);
+    }
+
+    if in_code_block && !code_lines.is_empty() {
+        render_code_block(ui, &code_lines.join("\n"), base_color, code_bg);
+    }
+}
+
+fn render_markdown_paragraph(
+    ui: &mut egui::Ui,
+    lines: &[String],
+    base_color: Color32,
+    code_bg: Color32,
+    is_error: bool,
+) {
+    let text = lines.join(" ");
+    ui.add(
+        egui::Label::new(inline_markdown_job(
+            &text,
+            base_color,
+            code_bg,
+            false,
+            12.0,
+            is_error,
+        ))
+        .wrap(),
+    );
+}
+
+fn parse_markdown_heading(line: &str) -> Option<(usize, &str)> {
+    for level in 1..=3 {
+        let marker = format!("{} ", "#".repeat(level));
+        if let Some(rest) = line.strip_prefix(&marker) {
+            return Some((level, rest));
+        }
+    }
+    None
+}
+
+fn is_markdown_rule(line: &str) -> bool {
+    matches!(line, "---" | "***" | "___")
+}
+
+fn parse_markdown_list_item_ascii(line: &str) -> Option<(String, &str)> {
+    if let Some(item) = line.strip_prefix("- ").or_else(|| line.strip_prefix("* ")) {
+        return Some(("-".to_owned(), item));
+    }
+
+    let digits_end = line.bytes().take_while(|byte| byte.is_ascii_digit()).count();
+    if digits_end > 0 {
+        let rest = &line[digits_end..];
+        if let Some(item) = rest.strip_prefix(". ") {
+            return Some((format!("{}.", &line[..digits_end]), item));
+        }
+    }
+
+    None
+}
+
+#[allow(dead_code)]
+fn parse_markdown_list_item(line: &str) -> Option<(String, &str)> {
+    if let Some(item) = line.strip_prefix("- ").or_else(|| line.strip_prefix("* ")) {
+        return Some(("•".to_owned(), item));
+    }
+
+    let digits_end = line.bytes().take_while(|byte| byte.is_ascii_digit()).count();
+    if digits_end > 0 {
+        let rest = &line[digits_end..];
+        if let Some(item) = rest.strip_prefix(". ") {
+            return Some((format!("{}.", &line[..digits_end]), item));
+        }
+    }
+
+    None
+}
+
+fn inline_markdown_job(
+    text: &str,
+    base_color: Color32,
+    code_bg: Color32,
+    strong: bool,
+    font_size: f32,
+    is_error: bool,
+) -> LayoutJob {
+    let mut job = LayoutJob::default();
+    append_inline_markdown(
+        &mut job,
+        text,
+        base_color,
+        code_bg,
+        strong,
+        false,
+        font_size,
+        is_error,
+    );
+    job
+}
+
+fn append_inline_markdown(
+    job: &mut LayoutJob,
+    text: &str,
+    base_color: Color32,
+    code_bg: Color32,
+    strong: bool,
+    italics: bool,
+    font_size: f32,
+    is_error: bool,
+) {
+    let default_format = TextFormat {
+        font_id: FontId::new(font_size, FontFamily::Proportional),
+        color: base_color,
+        italics,
+        ..Default::default()
+    };
+    let strong_format = TextFormat {
+        font_id: FontId::new(font_size + 0.2, FontFamily::Proportional),
+        color: base_color,
+        italics,
+        ..Default::default()
+    };
+    let code_format = TextFormat {
+        font_id: FontId::new((font_size - 0.5).max(11.0), FontFamily::Monospace),
+        color: if is_error {
+            color(255, 214, 214)
+        } else {
+            color(244, 246, 248)
+        },
+        background: code_bg,
+        ..Default::default()
+    };
+    let link_color = if is_error {
+        color(255, 178, 178)
+    } else {
+        color(132, 208, 255)
+    };
+    let link_format = TextFormat {
+        font_id: FontId::new(font_size, FontFamily::Proportional),
+        color: link_color,
+        underline: Stroke::new(1.0, link_color),
+        italics,
+        ..Default::default()
+    };
+
+    let mut i = 0usize;
+    while i < text.len() {
+        let rest = &text[i..];
+
+        if let Some(after) = rest.strip_prefix('`') {
+            if let Some(end) = after.find('`') {
+                job.append(&after[..end], 0.0, code_format.clone());
+                i += end + 2;
+                continue;
+            }
+        }
+
+        if let Some(after) = rest.strip_prefix("**") {
+            if let Some(end) = after.find("**") {
+                append_inline_markdown(
+                    job,
+                    &after[..end],
+                    base_color,
+                    code_bg,
+                    true,
+                    italics,
+                    font_size,
+                    is_error,
+                );
+                i += end + 4;
+                continue;
+            }
+        }
+
+        if let Some(after) = rest.strip_prefix("__") {
+            if let Some(end) = after.find("__") {
+                append_inline_markdown(
+                    job,
+                    &after[..end],
+                    base_color,
+                    code_bg,
+                    true,
+                    italics,
+                    font_size,
+                    is_error,
+                );
+                i += end + 4;
+                continue;
+            }
+        }
+
+        if let Some(after) = rest.strip_prefix('*') {
+            if let Some(end) = after.find('*') {
+                append_inline_markdown(
+                    job,
+                    &after[..end],
+                    base_color,
+                    code_bg,
+                    strong,
+                    true,
+                    font_size,
+                    is_error,
+                );
+                i += end + 2;
+                continue;
+            }
+        }
+
+        if let Some(after) = rest.strip_prefix('_') {
+            if let Some(end) = after.find('_') {
+                append_inline_markdown(
+                    job,
+                    &after[..end],
+                    base_color,
+                    code_bg,
+                    strong,
+                    true,
+                    font_size,
+                    is_error,
+                );
+                i += end + 2;
+                continue;
+            }
+        }
+
+        if let Some(after_open) = rest.strip_prefix('[') {
+            if let Some(label_end) = after_open.find("](") {
+                let label = &after_open[..label_end];
+                let after_label = &after_open[label_end + 2..];
+                if let Some(url_end) = after_label.find(')') {
+                    let url = &after_label[..url_end];
+                    job.append(label, 0.0, link_format.clone());
+                    if !url.is_empty() {
+                        job.append(
+                            &format!(" ({url})"),
+                            0.0,
+                            TextFormat {
+                                font_id: FontId::new(font_size - 1.0, FontFamily::Monospace),
+                                color: color(150, 154, 162),
+                                ..Default::default()
+                            },
+                        );
+                    }
+                    i += label_end + url_end + 4;
+                    continue;
+                }
+            }
+        }
+
+        let next_special = rest.find(['`', '*', '_', '[']).unwrap_or(rest.len());
+        let plain_len = next_special.max(1);
+        let plain = &rest[..plain_len];
+        let format = if strong {
+            strong_format.clone()
+        } else {
+            default_format.clone()
+        };
+        job.append(plain, 0.0, format);
+        i += plain.len();
+    }
+}
+
+#[allow(dead_code)]
+fn render_markdown_preview(ui: &mut egui::Ui, text: &str, is_error: bool) {
+    let base_color = if is_error {
+        color(255, 128, 128)
+    } else {
+        color(215, 217, 222)
+    };
+    let heading_color = if is_error {
+        color(255, 160, 160)
+    } else {
+        color(242, 244, 247)
+    };
+    let bullet_color = if is_error {
+        color(255, 145, 145)
+    } else {
+        color(132, 208, 255)
+    };
+    let code_bg = if is_error {
+        color(38, 18, 18)
+    } else {
+        color(12, 13, 16)
+    };
+
+    let mut in_code_block = false;
+    let mut code_lines: Vec<String> = Vec::new();
+
+    for line in text.lines() {
+        let trimmed = line.trim_end();
+        if trimmed.starts_with("```") {
+            if in_code_block {
+                render_code_block(ui, &code_lines.join("\n"), base_color, code_bg);
+                code_lines.clear();
+                in_code_block = false;
+            } else {
+                in_code_block = true;
+            }
+            continue;
+        }
+
+        if in_code_block {
+            code_lines.push(trimmed.to_owned());
+            continue;
+        }
+
+        if trimmed.is_empty() {
+            ui.add_space(4.0);
+            continue;
+        }
+
+        if let Some(heading) = trimmed.strip_prefix("# ") {
+            ui.label(
+                RichText::new(heading)
+                    .size(18.0)
+                    .color(heading_color),
+            );
+            continue;
+        }
+        if let Some(heading) = trimmed.strip_prefix("## ") {
+            ui.label(
+                RichText::new(heading)
+                    .size(15.0)
+                    .color(heading_color),
+            );
+            continue;
+        }
+        if let Some(item) = trimmed.strip_prefix("- ").or_else(|| trimmed.strip_prefix("* ")) {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(
+                    RichText::new("•")
+                        .family(FontFamily::Monospace)
+                        .size(12.0)
+                        .color(bullet_color),
+                );
+                ui.label(
+                    RichText::new(item)
+                        .family(FontFamily::Monospace)
+                        .size(12.0)
+                        .color(base_color),
+                );
+            });
+            continue;
+        }
+
+        ui.label(
+            RichText::new(trimmed)
+                .family(FontFamily::Monospace)
+                .size(12.0)
+                .color(base_color),
+        );
+    }
+
+    if in_code_block && !code_lines.is_empty() {
+        render_code_block(ui, &code_lines.join("\n"), base_color, code_bg);
+    }
+}
+
+fn render_code_block(ui: &mut egui::Ui, text: &str, text_color: Color32, bg_color: Color32) {
+    Frame::new()
+        .fill(bg_color)
+        .corner_radius(CornerRadius::ZERO)
+        .inner_margin(Margin::same(10))
+        .stroke(Stroke::new(1.0, color(44, 47, 54)))
+        .show(ui, |ui| {
+            ui.label(
+                RichText::new(text)
+                    .family(FontFamily::Monospace)
+                    .size(12.0)
+                    .color(text_color),
+            );
+        });
 }
 
 fn render_diff_navigation_panel(
@@ -2426,6 +3215,16 @@ fn looks_interactive_command(command: &str) -> bool {
     )
 }
 
+fn parse_agent_prompt(command: &str) -> Option<&str> {
+    let trimmed = command.trim();
+    if trimmed == "/agent" {
+        return Some("");
+    }
+    trimmed
+        .strip_prefix("/agent ")
+        .map(str::trim)
+}
+
 fn compose_terminal_command(directory: &str, command: &str) -> String {
     if cfg!(target_os = "windows") {
         let escaped = directory.replace('\'', "''");
@@ -2489,6 +3288,179 @@ fn execute_command_request(request: &CommandExecutionRequest) -> CommandExecutio
             success: false,
         },
     }
+}
+
+fn drain_command_results(command_executor: &CommandExecutor, entries: &mut [TranscriptEntry]) {
+    let mut blocks = Vec::new();
+    for entry in entries.iter() {
+        if let TranscriptEntry::Command(block) = entry {
+            blocks.push(block.clone());
+        }
+    }
+
+    command_executor.drain_results(&mut blocks);
+
+    for updated_block in blocks {
+        for entry in entries.iter_mut() {
+            if let TranscriptEntry::Command(block) = entry {
+                if block.id == updated_block.id {
+                    *block = updated_block.clone();
+                    break;
+                }
+            }
+        }
+    }
+}
+
+fn execute_agent_request(request: &AgentChatRequest) -> AgentChatResult {
+    if request.prompt.trim().is_empty() {
+        return AgentChatResult {
+            id: request.id,
+            response: "Usage: /agent <prompt>".to_owned(),
+            success: false,
+        };
+    }
+
+    let api_key = match load_groq_api_key() {
+        Some(value) => value,
+        _ => {
+            return AgentChatResult {
+                id: request.id,
+                response: format!(
+                    "Missing Groq API key. Add {} to {} or set {}.",
+                    GROQ_API_KEY_ENV, LOCAL_ENV_FILE, GROQ_API_KEY_ENV
+                ),
+                success: false,
+            };
+        }
+    };
+
+    let client = match Client::builder().timeout(Duration::from_secs(90)).build() {
+        Ok(client) => client,
+        Err(error) => {
+            return AgentChatResult {
+                id: request.id,
+                response: format!("Unable to create the Groq HTTP client: {error}"),
+                success: false,
+            };
+        }
+    };
+
+    let payload = GroqChatRequest {
+        model: GROQ_MODEL.to_owned(),
+        messages: vec![
+            GroqMessage {
+                role: "system".to_owned(),
+                content: AGENT_SYSTEM_PROMPT.to_owned(),
+            },
+            GroqMessage {
+                role: "user".to_owned(),
+                content: request.prompt.clone(),
+            },
+        ],
+    };
+
+    let response = client
+        .post(GROQ_API_URL)
+        .bearer_auth(api_key)
+        .json(&payload)
+        .send();
+
+    match response {
+        Ok(response) => {
+            let status = response.status();
+            if !status.is_success() {
+                let error_text = response.text().unwrap_or_else(|_| "Unknown error".to_owned());
+                return AgentChatResult {
+                    id: request.id,
+                    response: format!("Groq request failed with {}: {}", status, error_text),
+                    success: false,
+                };
+            }
+
+            match response.json::<GroqChatResponse>() {
+                Ok(body) => AgentChatResult {
+                    id: request.id,
+                    response: body
+                        .choices
+                        .into_iter()
+                        .next()
+                        .map(|choice| choice.message.content.trim().to_owned())
+                        .filter(|content| !content.is_empty())
+                        .unwrap_or_else(|| "Groq returned an empty response.".to_owned()),
+                    success: true,
+                },
+                Err(error) => AgentChatResult {
+                    id: request.id,
+                    response: format!("Unable to decode the Groq response: {error}"),
+                    success: false,
+                },
+            }
+        }
+        Err(error) => AgentChatResult {
+            id: request.id,
+            response: format!("Unable to reach Groq: {error}"),
+            success: false,
+        },
+    }
+}
+
+fn load_groq_api_key() -> Option<String> {
+    if let Some(value) = load_key_from_local_env_file(LOCAL_ENV_FILE, GROQ_API_KEY_ENV) {
+        return Some(value);
+    }
+
+    std::env::var(GROQ_API_KEY_ENV)
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+}
+
+fn load_key_from_local_env_file(path: &str, key: &str) -> Option<String> {
+    let contents = fs::read_to_string(path).ok()?;
+    for raw_line in contents.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+
+        let (candidate_key, candidate_value) = line.split_once('=')?;
+        if candidate_key.trim() != key {
+            continue;
+        }
+
+        let value = candidate_value
+            .trim()
+            .trim_matches('"')
+            .trim_matches('\'')
+            .to_owned();
+        if !value.is_empty() {
+            return Some(value);
+        }
+    }
+    None
+}
+
+#[derive(Serialize)]
+struct GroqChatRequest {
+    model: String,
+    messages: Vec<GroqMessage>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct GroqMessage {
+    role: String,
+    content: String,
+}
+
+#[derive(Deserialize)]
+struct GroqChatResponse {
+    choices: Vec<GroqChoice>,
+}
+
+#[derive(Deserialize)]
+struct GroqChoice {
+    message: GroqMessage,
 }
 
 fn load_tabs_from_workspace() -> Vec<SearchTab> {
