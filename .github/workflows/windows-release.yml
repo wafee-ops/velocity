@@ -38,17 +38,22 @@ jobs:
           New-Item -ItemType Directory -Force -Path dist\velocity-windows | Out-Null
           Copy-Item target\x86_64-pc-windows-msvc\release\velocity.exe dist\velocity-windows\velocity.exe
           Copy-Item README.md dist\velocity-windows\README.md
+          Copy-Item target\x86_64-pc-windows-msvc\release\velocity.exe dist\velocity-windows.exe
           Compress-Archive -Path dist\velocity-windows\* -DestinationPath dist\velocity-windows.zip -Force
 
       - name: Upload app artifact
         uses: actions/upload-artifact@v4
         with:
           name: velocity-windows
-          path: dist/velocity-windows.zip
+          path: |
+            dist/velocity-windows.exe
+            dist/velocity-windows.zip
           if-no-files-found: error
 
       - name: Publish release asset
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/velocity-windows.zip
+          files: |
+            dist/velocity-windows.exe
+            dist/velocity-windows.zip

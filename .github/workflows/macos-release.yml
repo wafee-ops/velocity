@@ -21,7 +21,7 @@ jobs:
       matrix:
         include:
           - name: intel
-            runner: macos-13
+            runner: macos-26-intel
             target: x86_64-apple-darwin
             artifact_name: velocity-macos-intel
           - name: apple-silicon
@@ -44,24 +44,93 @@ jobs:
       - name: Build release binary
         run: cargo build --release --target ${{ matrix.target }}
 
-      - name: Package app artifact
+      - name: Install icon tooling
+        run: python3 -m pip install --user pillow
+
+      - name: Package DMG artifact
         shell: bash
         run: |
-          mkdir -p dist/${{ matrix.artifact_name }}
-          cp target/${{ matrix.target }}/release/velocity dist/${{ matrix.artifact_name }}/velocity
-          cp README.md dist/${{ matrix.artifact_name }}/README.md
-          cd dist
-          zip -r ${{ matrix.artifact_name }}.zip ${{ matrix.artifact_name }}
+          set -euo pipefail
+          APP_NAME="Velocity.app"
+          APP_DIR="dist/${APP_NAME}"
+          DMG_NAME="${{ matrix.artifact_name }}.dmg"
+
+          mkdir -p "${APP_DIR}/Contents/MacOS" "${APP_DIR}/Contents/Resources"
+          cp "target/${{ matrix.target }}/release/velocity" "${APP_DIR}/Contents/MacOS/Velocity"
+          chmod +x "${APP_DIR}/Contents/MacOS/Velocity"
+          cp assets/icon.ico "${APP_DIR}/Contents/Resources/icon.ico"
+
+          python3 - <<'PY'
+          from pathlib import Path
+          from PIL import Image
+
+          icon_path = Path("assets/icon.ico")
+          iconset = Path("dist/icon.iconset")
+          iconset.mkdir(parents=True, exist_ok=True)
+
+          source = Image.open(icon_path)
+          frames = []
+          for index in range(getattr(source, "n_frames", 1)):
+              source.seek(index)
+              frames.append(source.copy().convert("RGBA"))
+          source = max(frames, key=lambda image: image.width * image.height)
+
+          for size in (16, 32, 128, 256, 512):
+              source.resize((size, size), Image.Resampling.LANCZOS).save(
+                  iconset / f"icon_{size}x{size}.png"
+              )
+              double_size = size * 2
+              source.resize((double_size, double_size), Image.Resampling.LANCZOS).save(
+                  iconset / f"icon_{size}x{size}@2x.png"
+              )
+          PY
+          iconutil -c icns dist/icon.iconset -o "${APP_DIR}/Contents/Resources/icon.icns"
+
+          cat > "${APP_DIR}/Contents/Info.plist" <<'PLIST'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleDevelopmentRegion</key>
+            <string>en</string>
+            <key>CFBundleExecutable</key>
+            <string>Velocity</string>
+            <key>CFBundleIconFile</key>
+            <string>icon.icns</string>
+            <key>CFBundleIdentifier</key>
+            <string>dev.wafee.velocity</string>
+            <key>CFBundleName</key>
+            <string>Velocity</string>
+            <key>CFBundlePackageType</key>
+            <string>APPL</string>
+            <key>CFBundleShortVersionString</key>
+            <string>${{ github.ref_name }}</string>
+            <key>CFBundleVersion</key>
+            <string>${{ github.run_number }}</string>
+            <key>LSMinimumSystemVersion</key>
+            <string>13.0</string>
+            <key>NSHighResolutionCapable</key>
+            <true/>
+          </dict>
+          </plist>
+          PLIST
+
+          hdiutil create \
+            -volname "Velocity" \
+            -srcfolder "${APP_DIR}" \
+            -ov \
+            -format UDZO \
+            "dist/${DMG_NAME}"
 
       - name: Upload app artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact_name }}
-          path: dist/${{ matrix.artifact_name }}.zip
+          path: dist/${{ matrix.artifact_name }}.dmg
           if-no-files-found: error
 
       - name: Publish release asset
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/${{ matrix.artifact_name }}.zip
+          files: dist/${{ matrix.artifact_name }}.dmg

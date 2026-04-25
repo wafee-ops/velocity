@@ -33,11 +33,16 @@ use syntect::{
 };
 
 fn main() -> eframe::Result<()> {
+    let mut viewport = ViewportBuilder::default()
+        .with_inner_size([1380.0, 860.0])
+        .with_min_inner_size([1040.0, 720.0])
+        .with_title("Velocity");
+    if let Some(icon) = app_icon() {
+        viewport = viewport.with_icon(icon);
+    }
+
     let options = eframe::NativeOptions {
-        viewport: ViewportBuilder::default()
-            .with_inner_size([1380.0, 860.0])
-            .with_min_inner_size([1040.0, 720.0])
-            .with_title("Velocity"),
+        viewport,
         renderer: eframe::Renderer::Wgpu,
         hardware_acceleration: eframe::HardwareAcceleration::Required,
         vsync: true,
@@ -52,6 +57,21 @@ fn main() -> eframe::Result<()> {
             Ok(Box::new(VelocityApp::new(cc.egui_ctx.clone())))
         }),
     )
+}
+
+fn app_icon() -> Option<egui::IconData> {
+    let image = image::load_from_memory_with_format(
+        include_bytes!("../assets/icon.ico"),
+        image::ImageFormat::Ico,
+    )
+    .ok()?
+    .into_rgba8();
+    let (width, height) = image.dimensions();
+    Some(egui::IconData {
+        rgba: image.into_raw(),
+        width,
+        height,
+    })
 }
 
 fn configure_theme(ctx: &egui::Context) {
