@@ -11,12 +11,12 @@ use std::{
     time::{Duration, Instant},
 };
 
+use eframe::egui::text::LayoutJob;
 use eframe::egui::{
     self, Align2, Color32, CornerRadius, FontData, FontDefinitions, FontFamily, FontId, Frame,
     Margin, RichText, ScrollArea, Stroke, StrokeKind, TextBuffer, TextEdit, TextFormat, Vec2,
     ViewportBuilder,
 };
-use eframe::egui::text::LayoutJob;
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use shadow_terminal::{
@@ -199,7 +199,8 @@ Available tools: \
 12. git_diff: returns git diff, optionally for a specific file. \
 After you receive a tool result, either answer normally in Markdown or emit another JSON tool call if you still need one. \
 Keep answers practical, concise, and grounded in the tool results.";
-const AGENT_COMMAND_SYSTEM_PROMPT: &str = "You are a shell command generator inside a desktop app. \
+const AGENT_COMMAND_SYSTEM_PROMPT: &str =
+    "You are a shell command generator inside a desktop app. \
 Return exactly one shell command for the current working directory. \
 Do not include markdown, JSON, explanations, or multiple commands. \
 Choose the most direct command that satisfies the user's request.";
@@ -479,6 +480,8 @@ struct VelocityApp {
     diff_navigation_open: bool,
     selected_diff_file: Option<String>,
     refocus_terminal_input: Option<usize>,
+    branch_picker_open: bool,
+    pending_branch_refresh_command_id: Option<u64>,
 }
 
 struct InputContext {
@@ -517,6 +520,8 @@ impl VelocityApp {
             diff_navigation_open: false,
             selected_diff_file: None,
             refocus_terminal_input: None,
+            branch_picker_open: false,
+            pending_branch_refresh_command_id: None,
         }
     }
 
@@ -545,12 +550,13 @@ impl VelocityApp {
 
         let command_id = self.next_command_id;
         self.next_command_id += 1;
-        self.transcript_entries.push(TranscriptEntry::Command(CommandBlock {
-            id: command_id,
-            command: command.clone(),
-            output: String::new(),
-            status: CommandBlockStatus::Running,
-        }));
+        self.transcript_entries
+            .push(TranscriptEntry::Command(CommandBlock {
+                id: command_id,
+                command: command.clone(),
+                output: String::new(),
+                status: CommandBlockStatus::Running,
+            }));
         self.command_executor.execute(CommandExecutionRequest {
             id: command_id,
             command,
@@ -644,9 +650,9 @@ impl VelocityApp {
     fn split_active_terminal(&mut self, ctx: &egui::Context) {
         let new_index = self.terminals.len();
         let pane = TerminalPane::new(ctx.clone(), new_index);
-        pane.backend.send(TerminalRequest::RunCommand(compose_directory_change_command(
-            &self.shell_directory,
-        )));
+        pane.backend.send(TerminalRequest::RunCommand(
+            compose_directory_change_command(&self.shell_directory),
+        ));
         self.terminals.push(pane);
         self.active_terminal = new_index;
     }
@@ -674,10 +680,11 @@ impl VelocityApp {
 
         self.record_command_history(&command);
         if let Some(pane) = self.terminals.get_mut(index) {
-            pane.backend.send(TerminalRequest::RunCommand(compose_terminal_command(
-                &self.shell_directory,
-                &command,
-            )));
+            pane.backend
+                .send(TerminalRequest::RunCommand(compose_terminal_command(
+                    &self.shell_directory,
+                    &command,
+                )));
             pane.command_input.clear();
         }
         self.refocus_terminal_input = Some(index);
@@ -717,7 +724,6 @@ impl VelocityApp {
         } else if index == self.selected_tab {
             self.selected_tab = self.selected_tab.min(self.tabs.len().saturating_sub(1));
         }
-
     }
 
     fn refresh_tab_contexts(&mut self) {
@@ -742,16 +748,17 @@ impl VelocityApp {
             return false;
         };
 
-        let Some(resolved_directory) = resolve_directory_target(&self.shell_directory, target) else {
+        let Some(resolved_directory) = resolve_directory_target(&self.shell_directory, target)
+        else {
             let command_id = self.next_command_id;
             self.next_command_id += 1;
             self.transcript_entries
                 .push(TranscriptEntry::Command(CommandBlock {
-                id: command_id,
-                command: command.to_owned(),
-                output: format!("Directory not found: {target}"),
-                status: CommandBlockStatus::Error,
-            }));
+                    id: command_id,
+                    command: command.to_owned(),
+                    output: format!("Directory not found: {target}"),
+                    status: CommandBlockStatus::Error,
+                }));
             return true;
         };
 
@@ -768,11 +775,11 @@ impl VelocityApp {
         self.next_command_id += 1;
         self.transcript_entries
             .push(TranscriptEntry::Command(CommandBlock {
-            id: command_id,
-            command: command.to_owned(),
-            output: format!("Changed directory to {resolved_directory}"),
-            status: CommandBlockStatus::Success,
-        }));
+                id: command_id,
+                command: command.to_owned(),
+                output: format!("Changed directory to {resolved_directory}"),
+                status: CommandBlockStatus::Success,
+            }));
         true
     }
 
@@ -853,7 +860,8 @@ impl VelocityApp {
 
     fn launch_interactive_command(&mut self, command: &str) {
         if let Some(pane) = self.active_terminal_pane() {
-            pane.backend.send(TerminalRequest::RunCommand(command.to_owned()));
+            pane.backend
+                .send(TerminalRequest::RunCommand(command.to_owned()));
         }
     }
 
@@ -873,6 +881,51 @@ impl VelocityApp {
         if !selected_exists {
             self.selected_diff_file = None;
         }
+    }
+
+    fn switch_branch(&mut self, branch: &str) {
+        let command_id = self.next_command_id;
+        self.next_command_id += 1;
+        let command = format!("git switch {branch}");
+        self.transcript_entries
+            .push(TranscriptEntry::Command(CommandBlock {
+                id: command_id,
+                command: command.clone(),
+                output: String::new(),
+                status: CommandBlockStatus::Running,
+            }));
+        self.command_executor.execute(CommandExecutionRequest {
+            id: command_id,
+            command,
+            working_directory: self.shell_directory.clone(),
+        });
+        self.pending_branch_refresh_command_id = Some(command_id);
+        self.branch_picker_open = false;
+        self.refocus_command_input = true;
+    }
+
+    fn refresh_branch_context_after_switch(&mut self) {
+        let Some(command_id) = self.pending_branch_refresh_command_id else {
+            return;
+        };
+        let Some(status) = self
+            .transcript_entries
+            .iter()
+            .find_map(|entry| match entry {
+                TranscriptEntry::Command(block) if block.id == command_id => Some(block.status),
+                _ => None,
+            })
+        else {
+            self.pending_branch_refresh_command_id = None;
+            return;
+        };
+        if status == CommandBlockStatus::Running {
+            return;
+        }
+
+        self.input_context = read_input_context_for_directory(&self.shell_directory);
+        self.refresh_tab_contexts();
+        self.pending_branch_refresh_command_id = None;
     }
 
     fn render_search_sidebar(&mut self, ui: &mut egui::Ui) {
@@ -949,7 +1002,8 @@ impl VelocityApp {
                             }
 
                             for index in matching_indices {
-                                let card = tab_card(ui, &self.tabs[index], index == self.selected_tab);
+                                let card =
+                                    tab_card(ui, &self.tabs[index], index == self.selected_tab);
                                 if card.response.clicked() {
                                     self.selected_tab = index;
                                 }
@@ -984,6 +1038,7 @@ impl eframe::App for VelocityApp {
             pane.backend.drain_updates(&mut pane.snapshot);
         }
         drain_command_results(&self.command_executor, &mut self.transcript_entries);
+        self.refresh_branch_context_after_switch();
         for result in self.agent_executor.drain_results() {
             self.apply_agent_result(result);
         }
@@ -1011,7 +1066,11 @@ impl eframe::App for VelocityApp {
         let sample_text = "WWWWWWWWWWWWWWWW";
         let char_size = ui
             .painter()
-            .layout_no_wrap(sample_text.to_owned(), terminal_font.clone(), Color32::WHITE)
+            .layout_no_wrap(
+                sample_text.to_owned(),
+                terminal_font.clone(),
+                Color32::WHITE,
+            )
             .size();
         let cell_width = (char_size.x / sample_text.len() as f32).max(7.0);
         let cell_height = (char_size.y + 3.0).max(18.0);
@@ -1055,44 +1114,47 @@ impl eframe::App for VelocityApp {
                         egui::pos2(center_right.max(center_left), root_rect.bottom()),
                     );
                     let bar_rect = egui::Rect::from_min_max(
-                        egui::pos2(center_rect.left(), (center_rect.bottom() - bar_height).max(center_rect.top())),
+                        egui::pos2(
+                            center_rect.left(),
+                            (center_rect.bottom() - bar_height).max(center_rect.top()),
+                        ),
                         center_rect.right_bottom(),
                     );
                     let transcript_rect = egui::Rect::from_min_max(
                         center_rect.min,
-                        egui::pos2(center_rect.right(), (bar_rect.top() - divider).max(center_rect.top())),
+                        egui::pos2(
+                            center_rect.right(),
+                            (bar_rect.top() - divider).max(center_rect.top()),
+                        ),
                     );
 
-                    ui.scope_builder(
-                        egui::UiBuilder::new().max_rect(sidebar_rect),
-                        |ui| self.render_search_sidebar(ui),
-                    );
+                    ui.scope_builder(egui::UiBuilder::new().max_rect(sidebar_rect), |ui| {
+                        self.render_search_sidebar(ui)
+                    });
 
-                    ui.scope_builder(
-                        egui::UiBuilder::new().max_rect(transcript_rect),
-                        |ui| {
-                            let transcript_height = transcript_rect.height().max(180.0);
-                            ScrollArea::vertical()
-                                .id_salt("command_transcript_scroll")
-                                .auto_shrink([false, false])
-                                .stick_to_bottom(true)
-                                .max_height(transcript_height)
-                                .show(ui, |ui| {
-                                    ui.set_min_height(transcript_height);
-                                    ui.spacing_mut().item_spacing = Vec2::ZERO;
-                                    let estimated_block_height = 86.0;
-                                    let bottom_padding = (transcript_height
-                                        - self.transcript_entries.len() as f32 * estimated_block_height)
-                                        .max(0.0);
-                                    if bottom_padding > 0.0 {
-                                        ui.add_space(bottom_padding);
-                                    }
-                                    for entry in &self.transcript_entries {
-                                        transcript_entry_card(ui, entry);
-                                    }
-                                });
-                        },
-                    );
+                    ui.scope_builder(egui::UiBuilder::new().max_rect(transcript_rect), |ui| {
+                        let transcript_height = transcript_rect.height().max(180.0);
+                        ScrollArea::vertical()
+                            .id_salt("command_transcript_scroll")
+                            .auto_shrink([false, false])
+                            .stick_to_bottom(true)
+                            .max_height(transcript_height)
+                            .show(ui, |ui| {
+                                ui.set_min_height(transcript_height);
+                                ui.spacing_mut().item_spacing = Vec2::ZERO;
+                                let estimated_block_height = 86.0;
+                                let bottom_padding = (transcript_height
+                                    - self.transcript_entries.len() as f32
+                                        * estimated_block_height)
+                                    .max(0.0);
+                                if bottom_padding > 0.0 {
+                                    ui.add_space(bottom_padding);
+                                }
+                                for entry in &self.transcript_entries {
+                                    transcript_entry_card(ui, entry);
+                                }
+                            });
+                    });
 
                     paint_command_bar(ui, bar_rect);
                     ui.scope_builder(
@@ -1116,6 +1178,32 @@ impl eframe::App for VelocityApp {
                             {
                                 self.toggle_diff_navigation();
                             }
+                            if context_output.branch_clicked {
+                                self.branch_picker_open = !self.branch_picker_open;
+                            }
+                            if self.branch_picker_open {
+                                let picker_pos = egui::pos2(
+                                    context_output.branch_rect.left(),
+                                    context_output.branch_rect.bottom() + 4.0,
+                                );
+                                let picker_output = render_branch_picker(
+                                    ui.ctx(),
+                                    picker_pos,
+                                    &self.shell_directory,
+                                    &self.input_context.branch,
+                                );
+                                if let Some(branch) = picker_output.selected_branch {
+                                    self.switch_branch(&branch);
+                                } else if ui.input(|input| {
+                                    input.pointer.any_pressed()
+                                        && input.pointer.interact_pos().is_some_and(|pos| {
+                                            !context_output.branch_rect.contains(pos)
+                                                && !picker_output.rect.contains(pos)
+                                        })
+                                }) {
+                                    self.branch_picker_open = false;
+                                }
+                            }
 
                             let suggestion = command_suggestion(
                                 &self.command_input,
@@ -1123,11 +1211,12 @@ impl eframe::App for VelocityApp {
                                 &self.available_commands,
                                 &self.shell_directory,
                             );
-                            let mut layouter = |ui: &egui::Ui, text: &dyn TextBuffer, wrap_width: f32| {
-                                let mut job = command_input_layout_job(text.as_str());
-                                job.wrap.max_width = wrap_width;
-                                ui.ctx().fonts_mut(|fonts| fonts.layout_job(job))
-                            };
+                            let mut layouter =
+                                |ui: &egui::Ui, text: &dyn TextBuffer, wrap_width: f32| {
+                                    let mut job = command_input_layout_job(text.as_str());
+                                    job.wrap.max_width = wrap_width;
+                                    ui.ctx().fonts_mut(|fonts| fonts.layout_job(job))
+                                };
                             let input_response = ui.add_sized(
                                 [ui.available_width(), 24.0],
                                 TextEdit::singleline(&mut self.command_input)
@@ -1188,18 +1277,15 @@ impl eframe::App for VelocityApp {
                     );
 
                     if let Some(diff_rect) = diff_rect {
-                        ui.scope_builder(
-                            egui::UiBuilder::new().max_rect(diff_rect),
-                            |ui| {
-                                render_diff_navigation_panel(
-                                    ui,
-                                    &self.shell_directory,
-                                    &self.input_context.diff_files,
-                                    &mut self.selected_diff_file,
-                                    &mut self.diff_navigation_open,
-                                );
-                            },
-                        );
+                        ui.scope_builder(egui::UiBuilder::new().max_rect(diff_rect), |ui| {
+                            render_diff_navigation_panel(
+                                ui,
+                                &self.shell_directory,
+                                &self.input_context.diff_files,
+                                &mut self.selected_diff_file,
+                                &mut self.diff_navigation_open,
+                            );
+                        });
                     }
                 } else {
                     let available = ui.available_size_before_wrap();
@@ -1208,8 +1294,8 @@ impl eframe::App for VelocityApp {
                     let pane_input_height = 46.0;
                     let total_separator_height =
                         separator_height * self.terminals.len().saturating_sub(1) as f32;
-                    let pane_height = ((available.y - total_separator_height) / pane_count as f32)
-                        .max(170.0);
+                    let pane_height =
+                        ((available.y - total_separator_height) / pane_count as f32).max(170.0);
 
                     for index in 0..self.terminals.len() {
                         let pane_width = ui.available_width();
@@ -1269,7 +1355,8 @@ impl eframe::App for VelocityApp {
                             .0;
                         paint_command_bar(ui, input_rect);
                         ui.scope_builder(
-                            egui::UiBuilder::new().max_rect(input_rect.shrink2(Vec2::new(10.0, 6.0))),
+                            egui::UiBuilder::new()
+                                .max_rect(input_rect.shrink2(Vec2::new(10.0, 6.0))),
                             |ui| {
                                 let suggestion = self.terminals.get(index).and_then(|pane| {
                                     command_suggestion(
@@ -1279,28 +1366,29 @@ impl eframe::App for VelocityApp {
                                         &self.shell_directory,
                                     )
                                 });
-                                let input_response = if let Some(pane) = self.terminals.get_mut(index) {
-                                    let mut layouter =
+                                let input_response =
+                                    if let Some(pane) = self.terminals.get_mut(index) {
+                                        let mut layouter =
                                         |ui: &egui::Ui, text: &dyn TextBuffer, wrap_width: f32| {
                                             let mut job = command_input_layout_job(text.as_str());
                                             job.wrap.max_width = wrap_width;
                                             ui.ctx().fonts_mut(|fonts| fonts.layout_job(job))
                                         };
-                                    ui.add_sized(
-                                        [ui.available_width(), 28.0],
-                                        TextEdit::singleline(&mut pane.command_input)
-                                            .id(pane.command_input_id)
-                                            .font(eframe::egui::TextStyle::Monospace)
-                                            .lock_focus(true)
-                                            .background_color(Color32::TRANSPARENT)
-                                            .text_color(color(245, 246, 248))
-                                            .margin(Vec2::new(0.0, 4.0))
-                                            .layouter(&mut layouter)
-                                            .frame(Frame::NONE),
-                                    )
-                                } else {
-                                    return;
-                                };
+                                        ui.add_sized(
+                                            [ui.available_width(), 28.0],
+                                            TextEdit::singleline(&mut pane.command_input)
+                                                .id(pane.command_input_id)
+                                                .font(eframe::egui::TextStyle::Monospace)
+                                                .lock_focus(true)
+                                                .background_color(Color32::TRANSPARENT)
+                                                .text_color(color(245, 246, 248))
+                                                .margin(Vec2::new(0.0, 4.0))
+                                                .layouter(&mut layouter)
+                                                .frame(Frame::NONE),
+                                        )
+                                    } else {
+                                        return;
+                                    };
 
                                 if input_response.clicked() {
                                     self.active_terminal = index;
@@ -1331,11 +1419,17 @@ impl eframe::App for VelocityApp {
                                             )
                                         })
                                     {
+                                        self.active_terminal = index;
                                         input_response.request_focus();
-                                        ui.memory_mut(|memory| memory.request_focus(command_input_id));
+                                        ui.memory_mut(|memory| {
+                                            memory.request_focus(command_input_id)
+                                        });
                                         self.run_terminal_pane_command(index);
                                         input_response.request_focus();
-                                        ui.memory_mut(|memory| memory.request_focus(command_input_id));
+                                        ui.memory_mut(|memory| {
+                                            memory.request_focus(command_input_id)
+                                        });
+                                        ui.ctx().request_repaint_after(Duration::from_millis(1));
                                         ui.ctx().request_repaint();
                                     }
                                 }
@@ -1491,7 +1585,11 @@ fn send_terminal_command(
     terminal: &SteppableTerminal,
     command: &str,
 ) -> Result<(), shadow_terminal::errors::PTYError> {
-    let enter = if cfg!(target_os = "windows") { "\r" } else { "\n" };
+    let enter = if cfg!(target_os = "windows") {
+        "\r"
+    } else {
+        "\n"
+    };
     terminal.paste_string(&format!("{command}{enter}"))
 }
 
@@ -1658,7 +1756,12 @@ fn map_key_event(key: egui::Key, modifiers: egui::Modifiers) -> Option<TerminalI
 
     let event = match key {
         egui::Key::Enter => TerminalInbound::Characters(
-            if cfg!(target_os = "windows") { "\r" } else { "\n" }.to_owned(),
+            if cfg!(target_os = "windows") {
+                "\r"
+            } else {
+                "\n"
+            }
+            .to_owned(),
         ),
         egui::Key::Tab => TerminalInbound::Characters("\t".to_owned()),
         egui::Key::Backspace => TerminalInbound::Characters("\u{8}".to_owned()),
@@ -1708,11 +1811,8 @@ fn paint_terminal(
             }
 
             if !cell.text.is_empty() && cell.text != " " {
-                let galley = painter.layout_no_wrap(
-                    cell.text.clone(),
-                    font_id.clone(),
-                    cell.foreground,
-                );
+                let galley =
+                    painter.layout_no_wrap(cell.text.clone(), font_id.clone(), cell.foreground);
                 painter.galley(egui::pos2(x, y + 1.0), galley, cell.foreground);
             }
 
@@ -1774,6 +1874,8 @@ fn paint_split_separator(ui: &egui::Ui, rect: egui::Rect) {
 
 struct CommandContextOutput {
     diff_clicked: bool,
+    branch_clicked: bool,
+    branch_rect: egui::Rect,
 }
 
 fn paint_command_context_boxes(
@@ -1823,8 +1925,23 @@ fn paint_command_context_boxes(
         egui::pos2(dir_box.right() + gap, y),
         Vec2::new(branch_w, box_height),
     );
-    painter.rect_filled(branch_box, CornerRadius::ZERO, box_fill);
-    painter.rect_stroke(branch_box, CornerRadius::ZERO, box_stroke, StrokeKind::Outside);
+    let branch_response = ui.interact(
+        branch_box,
+        ui.id().with("command_context_branch_box"),
+        egui::Sense::click(),
+    );
+    let branch_fill = if branch_response.hovered() {
+        color(35, 38, 44)
+    } else {
+        box_fill
+    };
+    painter.rect_filled(branch_box, CornerRadius::ZERO, branch_fill);
+    painter.rect_stroke(
+        branch_box,
+        CornerRadius::ZERO,
+        box_stroke,
+        StrokeKind::Outside,
+    );
     let branch_icon_origin = egui::pos2(
         branch_box.left() + inner_pad,
         branch_box.center().y - branch_icon_size.y / 2.0,
@@ -1865,7 +1982,12 @@ fn paint_command_context_boxes(
         box_fill
     };
     painter.rect_filled(changes_box, CornerRadius::ZERO, changes_fill);
-    painter.rect_stroke(changes_box, CornerRadius::ZERO, box_stroke, StrokeKind::Outside);
+    painter.rect_stroke(
+        changes_box,
+        CornerRadius::ZERO,
+        box_stroke,
+        StrokeKind::Outside,
+    );
     let changes_text_y = changes_box.center().y - added_galley.size().y / 2.0;
     painter.galley(
         egui::pos2(changes_box.left() + inner_pad, changes_text_y),
@@ -1883,22 +2005,130 @@ fn paint_command_context_boxes(
 
     CommandContextOutput {
         diff_clicked: changes_response.clicked(),
+        branch_clicked: branch_response.clicked(),
+        branch_rect: branch_box,
     }
 }
 
 fn paint_branch_badge_icon(painter: &egui::Painter, rect: egui::Rect, color: Color32) {
-    let stroke = Stroke::new(1.3, color);
-    let top = egui::pos2(rect.center().x, rect.top() + 2.0);
-    let mid = egui::pos2(rect.center().x, rect.center().y);
-    let left = egui::pos2(rect.left() + 3.0, rect.bottom() - 2.5);
-    let right = egui::pos2(rect.right() - 2.5, rect.bottom() - 2.5);
+    let stroke = Stroke::new(1.35, color);
+    let radius = (rect.width().min(rect.height()) * 0.16).clamp(1.5, 2.0);
+    let main_x = rect.left() + rect.width() * 0.28;
+    let branch_x = rect.right() - rect.width() * 0.22;
+    let top = egui::pos2(main_x, rect.top() + rect.height() * 0.2);
+    let bottom = egui::pos2(main_x, rect.bottom() - rect.height() * 0.2);
+    let branch = egui::pos2(branch_x, rect.top() + rect.height() * 0.38);
+    let junction = egui::pos2(main_x, rect.center().y);
 
-    painter.line_segment([top, mid], stroke);
-    painter.line_segment([mid, left], stroke);
-    painter.line_segment([mid, right], stroke);
-    painter.circle_filled(top, 2.0, color);
-    painter.circle_filled(left, 2.0, color);
-    painter.circle_filled(right, 2.0, color);
+    painter.line_segment(
+        [
+            top + Vec2::new(0.0, radius),
+            bottom - Vec2::new(0.0, radius),
+        ],
+        stroke,
+    );
+    painter.line_segment([junction, egui::pos2(branch.x - radius, branch.y)], stroke);
+    painter.circle_stroke(top, radius, stroke);
+    painter.circle_stroke(bottom, radius, stroke);
+    painter.circle_stroke(branch, radius, stroke);
+}
+
+struct BranchPickerOutput {
+    selected_branch: Option<String>,
+    rect: egui::Rect,
+}
+
+fn render_branch_picker(
+    ctx: &egui::Context,
+    anchor_pos: egui::Pos2,
+    directory: &str,
+    current_branch: &str,
+) -> BranchPickerOutput {
+    let branches = read_available_branches_for_directory(directory);
+    if branches.is_empty() {
+        return BranchPickerOutput {
+            selected_branch: None,
+            rect: egui::Rect::from_min_size(anchor_pos, Vec2::ZERO),
+        };
+    }
+
+    let row_height = 26.0;
+    let visible_rows = branches.len().min(8) as f32;
+    let picker_height = visible_rows * row_height + 18.0;
+    let picker_pos = anchor_pos;
+    let picker_rect = egui::Rect::from_min_size(picker_pos, Vec2::new(246.0, picker_height));
+    let mut selected_branch = None;
+
+    egui::Area::new(egui::Id::new("branch_picker"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(picker_pos)
+        .show(ctx, |ui| {
+            Frame::new()
+                .fill(color(18, 19, 23))
+                .inner_margin(Margin::same(8))
+                .stroke(Stroke::new(1.0, color(56, 58, 64)))
+                .show(ui, |ui| {
+                    ui.set_width(230.0);
+                    ScrollArea::vertical()
+                        .id_salt("branch_picker_scroll")
+                        .auto_shrink([false, false])
+                        .max_height(visible_rows * row_height)
+                        .show(ui, |ui| {
+                            ui.spacing_mut().item_spacing = Vec2::new(0.0, 4.0);
+                            for branch in branches {
+                                if branch_row(ui, &branch, branch == current_branch).clicked() {
+                                    selected_branch = Some(branch);
+                                }
+                            }
+                        });
+                });
+        });
+
+    BranchPickerOutput {
+        selected_branch,
+        rect: picker_rect,
+    }
+}
+
+fn branch_row(ui: &mut egui::Ui, branch: &str, selected: bool) -> egui::Response {
+    let desired = Vec2::new(ui.available_width(), 24.0);
+    let (rect, response) = ui.allocate_exact_size(desired, egui::Sense::click());
+    let fill = if selected {
+        color(39, 31, 12)
+    } else if response.hovered() {
+        color(35, 38, 44)
+    } else {
+        color(22, 23, 28)
+    };
+    ui.painter().rect_filled(rect, CornerRadius::ZERO, fill);
+    ui.painter().text(
+        rect.min + Vec2::new(8.0, 5.0),
+        Align2::LEFT_TOP,
+        branch,
+        FontId::new(12.0, FontFamily::Monospace),
+        if selected {
+            color(255, 208, 102)
+        } else {
+            color(223, 226, 230)
+        },
+    );
+    response
+}
+
+fn read_available_branches_for_directory(directory: &str) -> Vec<String> {
+    command_stdout(&[
+        "git",
+        "-C",
+        directory,
+        "branch",
+        "--format=%(refname:short)",
+    ])
+    .unwrap_or_default()
+    .lines()
+    .map(str::trim)
+    .filter(|branch| !branch.is_empty())
+    .map(str::to_owned)
+    .collect()
 }
 
 fn read_input_context_for_directory(directory: &str) -> InputContext {
@@ -1906,8 +2136,8 @@ fn read_input_context_for_directory(directory: &str) -> InputContext {
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| "no-branch".to_owned());
 
-    let diff_text = command_stdout(&["git", "-C", directory, "diff", "--shortstat"])
-        .unwrap_or_default();
+    let diff_text =
+        command_stdout(&["git", "-C", directory, "diff", "--shortstat"]).unwrap_or_default();
     let (added_lines, removed_lines) = parse_diff_shortstat(&diff_text);
     let diff_files = read_diff_files_for_directory(directory);
 
@@ -1953,11 +2183,9 @@ fn parse_diff_shortstat(diff_text: &str) -> (usize, usize) {
 }
 
 fn read_diff_files_for_directory(directory: &str) -> Vec<DiffFileEntry> {
-    let output = command_stdout(&["git", "-C", directory, "diff", "--name-status"]).unwrap_or_default();
-    output
-        .lines()
-        .filter_map(parse_diff_file_line)
-        .collect()
+    let output =
+        command_stdout(&["git", "-C", directory, "diff", "--name-status"]).unwrap_or_default();
+    output.lines().filter_map(parse_diff_file_line).collect()
 }
 
 fn parse_diff_file_line(line: &str) -> Option<DiffFileEntry> {
@@ -1986,21 +2214,16 @@ fn discover_available_commands() -> Vec<String> {
     let mut commands = BTreeSet::new();
 
     for builtin in [
-        "cd",
-        "cls",
-        "clear",
-        "dir",
-        "echo",
-        "ls",
-        "pwd",
-        "set",
-        "type",
-        "where",
+        "cd", "cls", "clear", "dir", "echo", "ls", "pwd", "set", "type", "where",
     ] {
         commands.insert(builtin.to_owned());
     }
 
-    let path_separator = if cfg!(target_os = "windows") { ';' } else { ':' };
+    let path_separator = if cfg!(target_os = "windows") {
+        ';'
+    } else {
+        ':'
+    };
     let executable_suffixes: &[&str] = if cfg!(target_os = "windows") {
         &["exe", "cmd", "bat", "com", "ps1"]
     } else {
@@ -2081,7 +2304,8 @@ fn command_suggestion(
         .next()
         .unwrap_or_default()
         .to_lowercase();
-    let has_arguments = trimmed_start.split_whitespace().nth(1).is_some() || trimmed_start.ends_with(' ');
+    let has_arguments =
+        trimmed_start.split_whitespace().nth(1).is_some() || trimmed_start.ends_with(' ');
 
     for (index, command) in history.iter().enumerate() {
         if command.starts_with(trimmed_start) && command != trimmed_start {
@@ -2273,15 +2497,8 @@ fn known_command_phrases(input: &str) -> Vec<&'static str> {
             "kubectl config use-context",
             "kubectl rollout restart deployment",
         ]),
-        "gh" => phrases.extend([
-            "gh auth status",
-            "gh pr diff",
-            "gh pr view --web",
-        ]),
-        "python" => phrases.extend([
-            "python -m pip install",
-            "python -m http.server",
-        ]),
+        "gh" => phrases.extend(["gh auth status", "gh pr diff", "gh pr view --web"]),
+        "python" => phrases.extend(["python -m pip install", "python -m http.server"]),
         _ => {}
     }
 
@@ -2309,17 +2526,9 @@ fn paint_command_suggestion(
         .layout_no_wrap(current_input.to_owned(), font_id.clone(), Color32::WHITE)
         .size()
         .x;
-    let pos = egui::pos2(
-        rect.left() + 4.0 + prefix_width,
-        rect.top() + 2.0,
-    );
-    ui.painter().text(
-        pos,
-        Align2::LEFT_TOP,
-        suffix,
-        font_id,
-        color(104, 108, 116),
-    );
+    let pos = egui::pos2(rect.left() + 4.0 + prefix_width, rect.top() + 2.0);
+    ui.painter()
+        .text(pos, Align2::LEFT_TOP, suffix, font_id, color(104, 108, 116));
 }
 
 fn command_input_layout_job(text: &str) -> LayoutJob {
@@ -2446,11 +2655,7 @@ fn render_agent_chat_output(ui: &mut egui::Ui, chat: &AgentChatBox) {
             );
         }
         AgentChatStatus::Success | AgentChatStatus::Error => {
-            render_ai_markdown(
-                ui,
-                &chat.response,
-                chat.status == AgentChatStatus::Error,
-            );
+            render_ai_markdown(ui, &chat.response, chat.status == AgentChatStatus::Error);
         }
     }
 }
@@ -2480,6 +2685,7 @@ fn render_ai_markdown(ui: &mut egui::Ui, text: &str, is_error: bool) {
 
     let mut in_code_block = false;
     let mut code_lines: Vec<String> = Vec::new();
+    let mut code_language: Option<String> = None;
     let mut paragraph_lines: Vec<String> = Vec::new();
 
     for line in text.lines() {
@@ -2490,10 +2696,18 @@ fn render_ai_markdown(ui: &mut egui::Ui, text: &str, is_error: bool) {
                 paragraph_lines.clear();
             }
             if in_code_block {
-                render_code_block(ui, &code_lines.join("\n"), base_color, code_bg);
+                render_syntect_code_block(
+                    ui,
+                    &code_lines.join("\n"),
+                    code_language.as_deref(),
+                    base_color,
+                    code_bg,
+                );
                 code_lines.clear();
+                code_language = None;
                 in_code_block = false;
             } else {
+                code_language = parse_code_fence_language(trimmed).map(str::to_owned);
                 in_code_block = true;
             }
             continue;
@@ -2569,12 +2783,7 @@ fn render_ai_markdown(ui: &mut egui::Ui, text: &str, is_error: bool) {
                 );
                 ui.add(
                     egui::Label::new(inline_markdown_job(
-                        item,
-                        base_color,
-                        code_bg,
-                        false,
-                        12.0,
-                        is_error,
+                        item, base_color, code_bg, false, 12.0, is_error,
                     ))
                     .wrap(),
                 );
@@ -2596,12 +2805,7 @@ fn render_ai_markdown(ui: &mut egui::Ui, text: &str, is_error: bool) {
                 );
                 ui.add(
                     egui::Label::new(inline_markdown_job(
-                        quote,
-                        base_color,
-                        code_bg,
-                        false,
-                        12.0,
-                        is_error,
+                        quote, base_color, code_bg, false, 12.0, is_error,
                     ))
                     .wrap(),
                 );
@@ -2631,7 +2835,13 @@ fn render_ai_markdown(ui: &mut egui::Ui, text: &str, is_error: bool) {
     }
 
     if in_code_block && !code_lines.is_empty() {
-        render_code_block(ui, &code_lines.join("\n"), base_color, code_bg);
+        render_syntect_code_block(
+            ui,
+            &code_lines.join("\n"),
+            code_language.as_deref(),
+            base_color,
+            code_bg,
+        );
     }
 }
 
@@ -2645,12 +2855,7 @@ fn render_markdown_paragraph(
     let text = lines.join(" ");
     ui.add(
         egui::Label::new(inline_markdown_job(
-            &text,
-            base_color,
-            code_bg,
-            false,
-            12.0,
-            is_error,
+            &text, base_color, code_bg, false, 12.0, is_error,
         ))
         .wrap(),
     );
@@ -2685,7 +2890,10 @@ fn parse_markdown_list_item_ascii(line: &str) -> Option<(String, &str)> {
         return Some(("-".to_owned(), item));
     }
 
-    let digits_end = line.bytes().take_while(|byte| byte.is_ascii_digit()).count();
+    let digits_end = line
+        .bytes()
+        .take_while(|byte| byte.is_ascii_digit())
+        .count();
     if digits_end > 0 {
         let rest = &line[digits_end..];
         if let Some(item) = rest.strip_prefix(". ") {
@@ -2706,7 +2914,10 @@ fn parse_markdown_list_item(line: &str) -> Option<(String, &str)> {
         return Some(("•".to_owned(), item));
     }
 
-    let digits_end = line.bytes().take_while(|byte| byte.is_ascii_digit()).count();
+    let digits_end = line
+        .bytes()
+        .take_while(|byte| byte.is_ascii_digit())
+        .count();
     if digits_end > 0 {
         let rest = &line[digits_end..];
         if let Some(item) = rest.strip_prefix(". ") {
@@ -2727,14 +2938,7 @@ fn inline_markdown_job(
 ) -> LayoutJob {
     let mut job = LayoutJob::default();
     append_inline_markdown(
-        &mut job,
-        text,
-        base_color,
-        code_bg,
-        strong,
-        false,
-        font_size,
-        is_error,
+        &mut job, text, base_color, code_bg, strong, false, font_size, is_error,
     );
     job
 }
@@ -2950,22 +3154,17 @@ fn render_markdown_preview(ui: &mut egui::Ui, text: &str, is_error: bool) {
         }
 
         if let Some(heading) = trimmed.strip_prefix("# ") {
-            ui.label(
-                RichText::new(heading)
-                    .size(18.0)
-                    .color(heading_color),
-            );
+            ui.label(RichText::new(heading).size(18.0).color(heading_color));
             continue;
         }
         if let Some(heading) = trimmed.strip_prefix("## ") {
-            ui.label(
-                RichText::new(heading)
-                    .size(15.0)
-                    .color(heading_color),
-            );
+            ui.label(RichText::new(heading).size(15.0).color(heading_color));
             continue;
         }
-        if let Some(item) = trimmed.strip_prefix("- ").or_else(|| trimmed.strip_prefix("* ")) {
+        if let Some(item) = trimmed
+            .strip_prefix("- ")
+            .or_else(|| trimmed.strip_prefix("* "))
+        {
             ui.horizontal_wrapped(|ui| {
                 ui.label(
                     RichText::new("•")
@@ -2997,19 +3196,31 @@ fn render_markdown_preview(ui: &mut egui::Ui, text: &str, is_error: bool) {
 }
 
 fn render_code_block(ui: &mut egui::Ui, text: &str, text_color: Color32, bg_color: Color32) {
+    render_syntect_code_block(ui, text, None, text_color, bg_color);
+}
+
+fn render_syntect_code_block(
+    ui: &mut egui::Ui,
+    text: &str,
+    syntax_hint: Option<&str>,
+    text_color: Color32,
+    bg_color: Color32,
+) {
     Frame::new()
         .fill(bg_color)
         .corner_radius(CornerRadius::ZERO)
         .inner_margin(Margin::same(10))
         .stroke(Stroke::new(1.0, color(44, 47, 54)))
         .show(ui, |ui| {
-            ui.label(
-                RichText::new(text)
-                    .family(FontFamily::Monospace)
-                    .size(12.0)
-                    .color(text_color),
-            );
+            ui.add(egui::Label::new(syntect_code_job(text, syntax_hint, text_color)).wrap());
         });
+}
+
+fn parse_code_fence_language(line: &str) -> Option<&str> {
+    line.trim()
+        .strip_prefix("```")
+        .map(str::trim)
+        .filter(|language| !language.is_empty())
 }
 
 fn render_diff_navigation_panel(
@@ -3062,7 +3273,12 @@ fn render_diff_navigation_panel(
             );
             ui.add_space(6.0);
 
-            let list_height = (ui.available_height() * 0.26).clamp(120.0, 220.0);
+            let row_height = 30.0;
+            let row_gap = 6.0;
+            let content_height = diff_files.len() as f32 * row_height
+                + diff_files.len().saturating_sub(1) as f32 * row_gap;
+            let max_list_height = (ui.available_height() * 0.26).clamp(120.0, 220.0);
+            let list_height = content_height.min(max_list_height).max(row_height);
             ScrollArea::vertical()
                 .id_salt("diff_file_list_scroll")
                 .auto_shrink([false, false])
@@ -3096,17 +3312,12 @@ fn render_diff_navigation_panel(
 
 fn diff_file_row(ui: &mut egui::Ui, file: &DiffFileEntry, selected: bool) -> egui::Response {
     let desired = Vec2::new(ui.available_width(), 30.0);
-    let (rect, _) = ui.allocate_exact_size(desired, egui::Sense::hover());
+    let (rect, response) = ui.allocate_exact_size(desired, egui::Sense::click());
     let font = FontId::new(11.0, FontFamily::Monospace);
     let text_width = text_width(ui, &file.path, &font);
     let button_rect = egui::Rect::from_min_size(
         rect.min + Vec2::new(6.0, 4.0),
         Vec2::new((text_width + 12.0).min(rect.width() - 12.0).max(36.0), 22.0),
-    );
-    let response = ui.interact(
-        button_rect,
-        ui.id().with(("diff_file_row", &file.path)),
-        egui::Sense::click(),
     );
     let fill = if selected {
         color(37, 40, 48)
@@ -3126,7 +3337,11 @@ fn diff_file_row(ui: &mut egui::Ui, file: &DiffFileEntry, selected: bool) -> egu
         ui.painter().rect_filled(
             button_rect,
             CornerRadius::ZERO,
-            if selected { color(48, 52, 62) } else { color(37, 40, 48) },
+            if selected {
+                color(48, 52, 62)
+            } else {
+                color(37, 40, 48)
+            },
         );
     }
     ui.painter().text(
@@ -3162,27 +3377,51 @@ fn render_selected_diff_code(ui: &mut egui::Ui, directory: &str, relative_path: 
                 .id_salt(("diff_code_scroll", relative_path))
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
-                let mut layouter = |ui: &egui::Ui, text: &dyn TextBuffer, wrap_width: f32| {
-                    let mut job = highlight_diff_patch(text.as_str());
-                    job.wrap.max_width = wrap_width;
-                    ui.ctx().fonts_mut(|fonts| fonts.layout_job(job))
-                };
-                ui.add(
-                    TextEdit::multiline(&mut diff_contents)
-                        .font(eframe::egui::TextStyle::Monospace)
-                        .desired_width(f32::INFINITY)
-                        .interactive(false)
-                        .layouter(&mut layouter)
-                        .margin(Vec2::new(10.0, 10.0))
-                        .frame(Frame::NONE),
-                );
-            });
+                    let mut layouter = |ui: &egui::Ui, text: &dyn TextBuffer, wrap_width: f32| {
+                        let mut job = highlight_diff_patch(text.as_str());
+                        job.wrap.max_width = wrap_width;
+                        ui.ctx().fonts_mut(|fonts| fonts.layout_job(job))
+                    };
+                    ui.add(
+                        TextEdit::multiline(&mut diff_contents)
+                            .font(eframe::egui::TextStyle::Monospace)
+                            .desired_width(f32::INFINITY)
+                            .interactive(false)
+                            .layouter(&mut layouter)
+                            .margin(Vec2::new(10.0, 10.0))
+                            .frame(Frame::NONE),
+                    );
+                });
         });
 }
 
 fn load_diff_patch_for_file(directory: &str, relative_path: &str) -> String {
-    command_stdout(&["git", "-C", directory, "diff", "--no-color", "--", relative_path])
-        .unwrap_or_default()
+    command_stdout(&[
+        "git",
+        "-C",
+        directory,
+        "diff",
+        "--no-color",
+        "--",
+        relative_path,
+    ])
+    .map(|patch| strip_diff_metadata(&patch))
+    .unwrap_or_default()
+}
+
+fn strip_diff_metadata(patch: &str) -> String {
+    patch
+        .lines()
+        .filter(|line| {
+            let trimmed = line.trim_start();
+            !trimmed.starts_with("@@")
+                && !trimmed.starts_with("diff --git ")
+                && !trimmed.starts_with("index ")
+                && !trimmed.starts_with("--- ")
+                && !trimmed.starts_with("+++ ")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 struct SyntaxHighlightResources {
@@ -3206,17 +3445,26 @@ fn syntax_highlight_resources() -> &'static SyntaxHighlightResources {
 }
 
 fn highlight_diff_patch(text: &str) -> LayoutJob {
+    syntect_code_job(text, Some("diff"), color(222, 225, 230))
+}
+
+fn syntect_code_job(text: &str, syntax_hint: Option<&str>, fallback_color: Color32) -> LayoutJob {
     let mut job = LayoutJob::default();
     let default = TextFormat {
         font_id: FontId::new(13.0, FontFamily::Monospace),
-        color: color(222, 225, 230),
+        color: fallback_color,
         ..Default::default()
     };
 
     let resources = syntax_highlight_resources();
-    let syntax = resources
-        .syntax_set
-        .find_syntax_by_extension("diff")
+    let syntax = syntax_hint
+        .and_then(|hint| {
+            resources
+                .syntax_set
+                .find_syntax_by_token(hint)
+                .or_else(|| resources.syntax_set.find_syntax_by_extension(hint))
+                .or_else(|| resources.syntax_set.find_syntax_by_name(hint))
+        })
         .unwrap_or_else(|| resources.syntax_set.find_syntax_plain_text());
     let mut highlighter = HighlightLines::new(syntax, &resources.theme);
 
@@ -3282,10 +3530,19 @@ fn resolve_directory_target(base_directory: &str, target: &str) -> Option<String
 
     let canonical = candidate.canonicalize().ok()?;
     if canonical.is_dir() {
-        Some(canonical.display().to_string().replace('\\', "/"))
+        Some(normalize_display_path(&canonical))
     } else {
         None
     }
+}
+
+fn normalize_display_path(path: &Path) -> String {
+    let value = path.display().to_string();
+    let without_verbatim = value
+        .strip_prefix(r"\\?\")
+        .or_else(|| value.strip_prefix("//?/"))
+        .unwrap_or(&value);
+    without_verbatim.replace('\\', "/")
 }
 
 fn suggest_directory_completion(base_directory: &str, partial: &str) -> Option<String> {
@@ -3296,7 +3553,9 @@ fn suggest_directory_completion(base_directory: &str, partial: &str) -> Option<S
     } else {
         let normalized = trimmed.replace('/', "\\");
         let partial_path = Path::new(&normalized);
-        let parent = partial_path.parent().filter(|parent| !parent.as_os_str().is_empty());
+        let parent = partial_path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty());
         let search_root = match parent {
             Some(parent) if partial_path.is_absolute() => parent.to_path_buf(),
             Some(parent) => base.join(parent),
@@ -3360,7 +3619,11 @@ fn compose_cd_completion(current_input: &str, directory: &str) -> String {
 }
 
 fn looks_interactive_command(command: &str) -> bool {
-    let first = command.split_whitespace().next().unwrap_or_default().to_lowercase();
+    let first = command
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .to_lowercase();
     matches!(
         first.as_str(),
         "vim"
@@ -3385,9 +3648,7 @@ fn parse_agent_prompt(command: &str) -> Option<&str> {
     if trimmed == "/agent" {
         return Some("");
     }
-    trimmed
-        .strip_prefix("/agent ")
-        .map(str::trim)
+    trimmed.strip_prefix("/agent ").map(str::trim)
 }
 
 fn compose_terminal_command(directory: &str, command: &str) -> String {
@@ -3408,7 +3669,10 @@ fn compose_directory_change_command(directory: &str) -> String {
     }
 }
 
-fn execute_command_request(request: &CommandExecutionRequest, result_tx: &Sender<CommandExecutionResult>) {
+fn execute_command_request(
+    request: &CommandExecutionRequest,
+    result_tx: &Sender<CommandExecutionResult>,
+) {
     let mut command = if cfg!(target_os = "windows") {
         let mut command = Command::new("powershell.exe");
         command.args(["-NoLogo", "-NoProfile", "-Command", &request.command]);
@@ -3625,8 +3889,9 @@ fn execute_agent_request(request: &AgentChatRequest) -> AgentChatResult {
             Ok(response) => {
                 let status = response.status();
                 if !status.is_success() {
-                    let error_text =
-                        response.text().unwrap_or_else(|_| "Unknown error".to_owned());
+                    let error_text = response
+                        .text()
+                        .unwrap_or_else(|_| "Unknown error".to_owned());
                     return AgentChatResult {
                         id: request.id,
                         response: format!("Groq request failed with {}: {}", status, error_text),
@@ -3670,9 +3935,9 @@ fn execute_agent_request(request: &AgentChatRequest) -> AgentChatResult {
             let generated_command = extract_generated_command(&content);
             return AgentChatResult {
                 id: request.id,
-                response: generated_command
-                    .clone()
-                    .unwrap_or_else(|| format!("The AI did not return a runnable command: {content}")),
+                response: generated_command.clone().unwrap_or_else(|| {
+                    format!("The AI did not return a runnable command: {content}")
+                }),
                 success: generated_command.is_some(),
                 mode: request.mode,
                 generated_command,
@@ -3867,9 +4132,7 @@ fn execute_read_file_tool(working_directory: &str, path: &str) -> String {
         Err(error) => return error,
     };
     match fs::read_to_string(&full_path) {
-        Ok(contents) => {
-            truncate_agent_tool_output(contents)
-        }
+        Ok(contents) => truncate_agent_tool_output(contents),
         Err(error) => format!("Tool error: {error}"),
     }
 }
@@ -3906,7 +4169,11 @@ fn execute_append_file_tool(working_directory: &str, path: &str, content: &str) 
         .open(&full_path)
     {
         Ok(mut file) => match std::io::Write::write_all(&mut file, content.as_bytes()) {
-            Ok(_) => format!("Appended {} bytes to {}", content.len(), full_path.display()),
+            Ok(_) => format!(
+                "Appended {} bytes to {}",
+                content.len(),
+                full_path.display()
+            ),
             Err(error) => format!("Tool error: {error}"),
         },
         Err(error) => format!("Tool error: {error}"),
@@ -4033,8 +4300,15 @@ fn execute_file_info_tool(working_directory: &str, path: &str) -> String {
 
 fn execute_git_status_tool(working_directory: &str) -> String {
     truncate_agent_tool_output(
-        command_stdout(&["git", "-C", working_directory, "status", "--short", "--branch"])
-            .unwrap_or_else(|| "Tool error: unable to run git status.".to_owned()),
+        command_stdout(&[
+            "git",
+            "-C",
+            working_directory,
+            "status",
+            "--short",
+            "--branch",
+        ])
+        .unwrap_or_else(|| "Tool error: unable to run git status.".to_owned()),
     )
 }
 
@@ -4056,10 +4330,14 @@ fn resolve_agent_relative_path(working_directory: &str, path: &str) -> Result<Pa
     if candidate.is_absolute() {
         return Err("Tool error: absolute paths are not allowed.".to_owned());
     }
-    if candidate
-        .components()
-        .any(|component| matches!(component, std::path::Component::ParentDir | std::path::Component::Prefix(_) | std::path::Component::RootDir))
-    {
+    if candidate.components().any(|component| {
+        matches!(
+            component,
+            std::path::Component::ParentDir
+                | std::path::Component::Prefix(_)
+                | std::path::Component::RootDir
+        )
+    }) {
         return Err("Tool error: paths must stay inside the current working directory.".to_owned());
     }
     Ok(Path::new(working_directory).join(candidate))
@@ -4154,7 +4432,7 @@ fn default_new_tab(existing_tabs: &[SearchTab]) -> SearchTab {
 fn current_directory_label() -> String {
     std::env::current_dir()
         .ok()
-        .map(|path| path.display().to_string().replace('\\', "/"))
+        .map(|path| normalize_display_path(&path))
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| "workspace".to_owned())
 }
@@ -4199,7 +4477,12 @@ fn display_tab_path(directory: &str) -> String {
     directory.replace('/', "\\")
 }
 
-fn trailing_tab_path_for_width(ui: &egui::Ui, directory: &str, font: &FontId, max_width: f32) -> String {
+fn trailing_tab_path_for_width(
+    ui: &egui::Ui,
+    directory: &str,
+    font: &FontId,
+    max_width: f32,
+) -> String {
     let normalized = display_tab_path(directory);
     if text_width(ui, &normalized, font) <= max_width {
         return normalized;
@@ -4256,17 +4539,13 @@ fn paint_tab_path(ui: &egui::Ui, rect: egui::Rect, directory: &str) {
     let font = FontId::proportional(9.5);
     let shown_path = trailing_tab_path_for_width(ui, directory, &font, rect.width().max(24.0));
     let path_color = color(138, 142, 149);
-    let fade_color = Color32::from_rgba_unmultiplied(path_color.r(), path_color.g(), path_color.b(), 72);
+    let fade_color =
+        Color32::from_rgba_unmultiplied(path_color.r(), path_color.g(), path_color.b(), 72);
 
     if let Some(rest) = shown_path.strip_prefix("...\\") {
         let fade = "...\\";
-        ui.painter().text(
-            rect.min,
-            Align2::LEFT_TOP,
-            fade,
-            font.clone(),
-            fade_color,
-        );
+        ui.painter()
+            .text(rect.min, Align2::LEFT_TOP, fade, font.clone(), fade_color);
         let fade_width = text_width(ui, fade, &font);
         ui.painter().text(
             rect.min + Vec2::new(fade_width, 0.0),
@@ -4277,13 +4556,8 @@ fn paint_tab_path(ui: &egui::Ui, rect: egui::Rect, directory: &str) {
         );
     } else if let Some(rest) = shown_path.strip_prefix("...") {
         let fade = "...";
-        ui.painter().text(
-            rect.min,
-            Align2::LEFT_TOP,
-            fade,
-            font.clone(),
-            fade_color,
-        );
+        ui.painter()
+            .text(rect.min, Align2::LEFT_TOP, fade, font.clone(), fade_color);
         let fade_width = text_width(ui, fade, &font);
         ui.painter().text(
             rect.min + Vec2::new(fade_width, 0.0),
@@ -4293,13 +4567,8 @@ fn paint_tab_path(ui: &egui::Ui, rect: egui::Rect, directory: &str) {
             path_color,
         );
     } else {
-        ui.painter().text(
-            rect.min,
-            Align2::LEFT_TOP,
-            shown_path,
-            font,
-            path_color,
-        );
+        ui.painter()
+            .text(rect.min, Align2::LEFT_TOP, shown_path, font, path_color);
     }
 }
 
@@ -4378,7 +4647,14 @@ fn tab_card(ui: &mut egui::Ui, tab: &SearchTab, selected: bool) -> TabCardOutput
     } else {
         color(34, 34, 36)
     };
-    let stroke = Stroke::new(1.0, if selected { color(68, 68, 72) } else { color(34, 34, 36) });
+    let stroke = Stroke::new(
+        1.0,
+        if selected {
+            color(68, 68, 72)
+        } else {
+            color(34, 34, 36)
+        },
+    );
     let hovered = response.hovered();
 
     ui.painter().rect(
@@ -4388,10 +4664,8 @@ fn tab_card(ui: &mut egui::Ui, tab: &SearchTab, selected: bool) -> TabCardOutput
         stroke,
         StrokeKind::Outside,
     );
-    let icon_rect = egui::Rect::from_min_size(
-        card_rect.min + Vec2::new(10.0, 9.0),
-        Vec2::new(16.0, 16.0),
-    );
+    let icon_rect =
+        egui::Rect::from_min_size(card_rect.min + Vec2::new(10.0, 9.0), Vec2::new(16.0, 16.0));
     paint_tab_icon(ui.painter(), icon_rect, tab.icon);
     ui.painter().text(
         card_rect.min + Vec2::new(34.0, 6.0),
@@ -4471,18 +4745,17 @@ fn paint_tab_icon(painter: &egui::Painter, rect: egui::Rect, icon: TabIcon) {
     }
 }
 
-fn paint_tab_hover_button(
-    painter: &egui::Painter,
-    rect: egui::Rect,
-    label: &str,
-    hovered: bool,
-) {
+fn paint_tab_hover_button(painter: &egui::Painter, rect: egui::Rect, label: &str, hovered: bool) {
     painter.text(
         rect.center(),
         Align2::CENTER_CENTER,
         label,
         FontId::proportional(12.0),
-        if hovered { color(236, 238, 241) } else { color(125, 129, 136) },
+        if hovered {
+            color(236, 238, 241)
+        } else {
+            color(125, 129, 136)
+        },
     );
 }
 
