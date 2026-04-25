@@ -44,9 +44,6 @@ jobs:
       - name: Build release binary
         run: cargo build --release --target ${{ matrix.target }}
 
-      - name: Install icon tooling
-        run: python3 -m pip install --user pillow
-
       - name: Package DMG artifact
         shell: bash
         run: |
@@ -60,32 +57,6 @@ jobs:
           chmod +x "${APP_DIR}/Contents/MacOS/Velocity"
           cp assets/icon.ico "${APP_DIR}/Contents/Resources/icon.ico"
 
-          python3 - <<'PY'
-          from pathlib import Path
-          from PIL import Image
-
-          icon_path = Path("assets/icon.ico")
-          iconset = Path("dist/icon.iconset")
-          iconset.mkdir(parents=True, exist_ok=True)
-
-          source = Image.open(icon_path)
-          frames = []
-          for index in range(getattr(source, "n_frames", 1)):
-              source.seek(index)
-              frames.append(source.copy().convert("RGBA"))
-          source = max(frames, key=lambda image: image.width * image.height)
-
-          for size in (16, 32, 128, 256, 512):
-              source.resize((size, size), Image.Resampling.LANCZOS).save(
-                  iconset / f"icon_{size}x{size}.png"
-              )
-              double_size = size * 2
-              source.resize((double_size, double_size), Image.Resampling.LANCZOS).save(
-                  iconset / f"icon_{size}x{size}@2x.png"
-              )
-          PY
-          iconutil -c icns dist/icon.iconset -o "${APP_DIR}/Contents/Resources/icon.icns"
-
           cat > "${APP_DIR}/Contents/Info.plist" <<'PLIST'
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -96,7 +67,7 @@ jobs:
             <key>CFBundleExecutable</key>
             <string>Velocity</string>
             <key>CFBundleIconFile</key>
-            <string>icon.icns</string>
+            <string>icon.ico</string>
             <key>CFBundleIdentifier</key>
             <string>dev.wafee.velocity</string>
             <key>CFBundleName</key>
