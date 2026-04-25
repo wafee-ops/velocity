@@ -2,9 +2,11 @@ use std::{
     collections::BTreeSet,
     ffi::OsString,
     fs,
+    io::{BufRead, BufReader},
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
     sync::mpsc::{self, Receiver, Sender},
+    sync::OnceLock,
     thread,
     time::{Duration, Instant},
 };
@@ -22,6 +24,12 @@ use shadow_terminal::{
     steppable_terminal::{Input as TerminalInput, SteppableTerminal},
     termwiz::color::{ColorAttribute, SrgbaTuple},
     wezterm_term,
+};
+use syntect::{
+    easy::HighlightLines,
+    highlighting::{Style, Theme, ThemeSet},
+    parsing::SyntaxSet,
+    util::LinesWithEndings,
 };
 
 fn main() -> eframe::Result<()> {
@@ -173,10 +181,28 @@ const GROQ_MODEL: &str = "openai/gpt-oss-120b";
 const GROQ_API_KEY_ENV: &str = "GROQ_API_KEY";
 const LOCAL_ENV_FILE: &str = ".env.local";
 const AGENT_SYSTEM_PROMPT: &str = "You are an action-oriented coding agent inside a desktop app. \
-The user may want help with internet research, file edits, file deletion, and sandboxed command execution. \
-You do not have direct tool execution in this chat endpoint, so do not claim you already ran commands, browsed, or changed files unless the user pasted results. \
-When those actions would help, clearly state the exact commands, file changes, or internet lookups you would perform. \
-Format answers cleanly in Markdown, keep them practical, and prefer concrete steps over abstract advice.";
+You can use local tools when needed. \
+When you want to use a tool, respond with only valid JSON. \
+Do not wrap the JSON in code fences. Do not add commentary before or after it. \
+Available tools: \
+1. shell: runs a shell command in the current working directory and returns stdout/stderr. \
+2. read_file: reads a UTF-8 text file relative to the current working directory. \
+3. write_file: replaces a UTF-8 text file with the provided content. \
+4. append_file: appends UTF-8 text to a file. \
+5. replace_in_file: replaces one exact substring with another in a file. \
+6. list_dir: lists files and folders in a directory. \
+7. mkdir: creates a directory recursively. \
+8. rename_path: renames or moves a file or folder. \
+9. delete_path: deletes a file or folder recursively. \
+10. file_info: returns metadata for a path. \
+11. git_status: returns git status for the current working directory. \
+12. git_diff: returns git diff, optionally for a specific file. \
+After you receive a tool result, either answer normally in Markdown or emit another JSON tool call if you still need one. \
+Keep answers practical, concise, and grounded in the tool results.";
+const AGENT_COMMAND_SYSTEM_PROMPT: &str = "You are a shell command generator inside a desktop app. \
+Return exactly one shell command for the current working directory. \
+Do not include markdown, JSON, explanations, or multiple commands. \
+Choose the most direct command that satisfies the user's request.";
 
 enum TerminalRequest {
     RunCommand(String),
@@ -225,14 +251,22 @@ struct CommandExecutionRequest {
 #[derive(Clone)]
 struct CommandExecutionResult {
     id: u64,
-    output: String,
+    output_chunk: String,
+    done: bool,
     success: bool,
+}
+
+enum CommandStreamMessage {
+    Chunk(String),
+    Closed,
 }
 
 #[derive(Clone)]
 struct AgentChatRequest {
     id: u64,
     prompt: String,
+    working_directory: String,
+    mode: AgentRequestMode,
 }
 
 #[derive(Clone)]
@@ -240,6 +274,20 @@ struct AgentChatResult {
     id: u64,
     response: String,
     success: bool,
+    mode: AgentRequestMode,
+    generated_command: Option<String>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AgentRequestMode {
+    Chat,
+    Command,
+}
+
+#[derive(Clone, Copy)]
+enum MainInputSubmitMode {
+    Command,
+    AiCommand,
 }
 
 #[derive(Clone)]
@@ -343,8 +391,7 @@ impl CommandExecutor {
 
         thread::spawn(move || {
             while let Ok(request) = request_rx.recv() {
-                let result = execute_command_request(&request);
-                let _ = result_tx.send(result);
+                execute_command_request(&request, &result_tx);
             }
         });
 
@@ -361,12 +408,14 @@ impl CommandExecutor {
     fn drain_results(&self, blocks: &mut Vec<CommandBlock>) {
         while let Ok(result) = self.result_rx.try_recv() {
             if let Some(block) = blocks.iter_mut().find(|block| block.id == result.id) {
-                block.output = result.output;
-                block.status = if result.success {
-                    CommandBlockStatus::Success
-                } else {
-                    CommandBlockStatus::Error
-                };
+                block.output.push_str(&result.output_chunk);
+                if result.done {
+                    block.status = if result.success {
+                        CommandBlockStatus::Success
+                    } else {
+                        CommandBlockStatus::Error
+                    };
+                }
             }
         }
     }
@@ -394,23 +443,12 @@ impl AgentExecutor {
         let _ = self.request_tx.send(request);
     }
 
-    fn drain_results(&self, entries: &mut [TranscriptEntry]) {
+    fn drain_results(&self) -> Vec<AgentChatResult> {
+        let mut results = Vec::new();
         while let Ok(result) = self.result_rx.try_recv() {
-            for entry in entries.iter_mut() {
-                if let TranscriptEntry::Agent(chat) = entry {
-                    if chat.id == result.id {
-                        chat.response = result.response.clone();
-                        chat.status = if result.success {
-                            AgentChatStatus::Success
-                        } else {
-                            AgentChatStatus::Error
-                        };
-                        chat.completed_at = Some(Instant::now());
-                        break;
-                    }
-                }
-            }
+            results.push(result);
         }
+        results
     }
 }
 
@@ -521,6 +559,32 @@ impl VelocityApp {
         self.command_input.clear();
     }
 
+    fn maybe_send_ai_command(&mut self) {
+        let prompt = self.command_input.trim().to_owned();
+        if prompt.is_empty() {
+            return;
+        }
+
+        self.record_command_history(&prompt);
+        let request_id = self.next_command_id;
+        self.next_command_id += 1;
+        self.agent_executor.execute(AgentChatRequest {
+            id: request_id,
+            prompt,
+            working_directory: self.shell_directory.clone(),
+            mode: AgentRequestMode::Command,
+        });
+        self.command_input.clear();
+    }
+
+    fn submit_main_input(&mut self, mode: MainInputSubmitMode) {
+        match mode {
+            MainInputSubmitMode::Command => self.maybe_send_command(),
+            MainInputSubmitMode::AiCommand => self.maybe_send_ai_command(),
+        }
+        self.refocus_command_input = true;
+    }
+
     fn forward_terminal_input(&mut self, ctx: &egui::Context) {
         if self
             .active_terminal_pane()
@@ -616,6 +680,7 @@ impl VelocityApp {
             )));
             pane.command_input.clear();
         }
+        self.refocus_terminal_input = Some(index);
     }
 
     fn add_sidebar_tab(&mut self) {
@@ -731,8 +796,59 @@ impl VelocityApp {
         self.agent_executor.execute(AgentChatRequest {
             id: chat_id,
             prompt,
+            working_directory: self.shell_directory.clone(),
+            mode: AgentRequestMode::Chat,
         });
         true
+    }
+
+    fn apply_agent_result(&mut self, result: AgentChatResult) {
+        match result.mode {
+            AgentRequestMode::Chat => {
+                for entry in &mut self.transcript_entries {
+                    if let TranscriptEntry::Agent(chat) = entry {
+                        if chat.id == result.id {
+                            chat.response = result.response.clone();
+                            chat.status = if result.success {
+                                AgentChatStatus::Success
+                            } else {
+                                AgentChatStatus::Error
+                            };
+                            chat.completed_at = Some(Instant::now());
+                            break;
+                        }
+                    }
+                }
+            }
+            AgentRequestMode::Command => {
+                if let Some(command) = result.generated_command {
+                    let command_id = self.next_command_id;
+                    self.next_command_id += 1;
+                    self.transcript_entries
+                        .push(TranscriptEntry::Command(CommandBlock {
+                            id: command_id,
+                            command: command.clone(),
+                            output: String::new(),
+                            status: CommandBlockStatus::Running,
+                        }));
+                    self.command_executor.execute(CommandExecutionRequest {
+                        id: command_id,
+                        command,
+                        working_directory: self.shell_directory.clone(),
+                    });
+                } else {
+                    let command_id = self.next_command_id;
+                    self.next_command_id += 1;
+                    self.transcript_entries
+                        .push(TranscriptEntry::Command(CommandBlock {
+                            id: command_id,
+                            command: "AI command generation".to_owned(),
+                            output: result.response,
+                            status: CommandBlockStatus::Error,
+                        }));
+                }
+            }
+        }
     }
 
     fn launch_interactive_command(&mut self, command: &str) {
@@ -755,11 +871,7 @@ impl VelocityApp {
         });
 
         if !selected_exists {
-            self.selected_diff_file = self
-                .input_context
-                .diff_files
-                .first()
-                .map(|file| file.path.clone());
+            self.selected_diff_file = None;
         }
     }
 
@@ -872,7 +984,9 @@ impl eframe::App for VelocityApp {
             pane.backend.drain_updates(&mut pane.snapshot);
         }
         drain_command_results(&self.command_executor, &mut self.transcript_entries);
-        self.agent_executor.drain_results(&mut self.transcript_entries);
+        for result in self.agent_executor.drain_results() {
+            self.apply_agent_result(result);
+        }
         let terminal_changed = self
             .terminals
             .iter()
@@ -915,7 +1029,7 @@ impl eframe::App for VelocityApp {
                     let bar_height = 72.0;
                     let divider = 1.0;
                     let drawer_width = if self.diff_navigation_open {
-                        (root_rect.width() * 0.34).clamp(280.0, 460.0)
+                        (root_rect.width() * 0.44).clamp(420.0, 760.0)
                     } else {
                         0.0
                     };
@@ -1041,11 +1155,21 @@ impl eframe::App for VelocityApp {
                             }
                             if ui.memory(|memory| memory.has_focus(self.command_input_id))
                                 && ui.input_mut(|input| {
+                                    input.consume_key(egui::Modifiers::CTRL, egui::Key::Enter)
+                                })
+                            {
+                                self.submit_main_input(MainInputSubmitMode::AiCommand);
+                                input_response.request_focus();
+                                ui.memory_mut(|memory| memory.request_focus(self.command_input_id));
+                                ui.ctx().request_repaint();
+                            } else if ui.memory(|memory| memory.has_focus(self.command_input_id))
+                                && ui.input_mut(|input| {
                                     input.consume_key(egui::Modifiers::NONE, egui::Key::Enter)
                                 })
                             {
-                                self.maybe_send_command();
-                                self.refocus_command_input = true;
+                                self.submit_main_input(MainInputSubmitMode::Command);
+                                input_response.request_focus();
+                                ui.memory_mut(|memory| memory.request_focus(self.command_input_id));
                                 ui.ctx().request_repaint();
                             }
                             if let Some(suggestion) = suggestion.as_ref() {
@@ -1207,8 +1331,11 @@ impl eframe::App for VelocityApp {
                                             )
                                         })
                                     {
+                                        input_response.request_focus();
+                                        ui.memory_mut(|memory| memory.request_focus(command_input_id));
                                         self.run_terminal_pane_command(index);
-                                        self.refocus_terminal_input = Some(index);
+                                        input_response.request_focus();
+                                        ui.memory_mut(|memory| memory.request_focus(command_input_id));
                                         ui.ctx().request_repaint();
                                     }
                                 }
@@ -1364,13 +1491,8 @@ fn send_terminal_command(
     terminal: &SteppableTerminal,
     command: &str,
 ) -> Result<(), shadow_terminal::errors::PTYError> {
-    terminal.paste_string(command)?;
-    let enter = if cfg!(target_os = "windows") {
-        "\r"
-    } else {
-        "\n"
-    };
-    terminal.send_input(TerminalInput::Characters(enter.to_owned()))
+    let enter = if cfg!(target_os = "windows") { "\r" } else { "\n" };
+    terminal.paste_string(&format!("{command}{enter}"))
 }
 
 fn snapshot_terminal(terminal: &mut SteppableTerminal) -> TerminalSnapshot {
@@ -1940,6 +2062,12 @@ fn command_suggestion(
         return None;
     }
 
+    if "/agent".starts_with(trimmed_start) && trimmed_start != "/agent" {
+        return Some(CommandSuggestion {
+            completion: "/agent ".to_owned(),
+        });
+    }
+
     if let Some(partial) = parse_cd_target(trimmed_start) {
         let suggestion = suggest_directory_completion(shell_directory, partial)?;
         return Some(CommandSuggestion {
@@ -2103,6 +2231,7 @@ fn known_command_phrases(input: &str) -> Vec<&'static str> {
         "pytest -q",
         "pytest -k",
         "uvicorn main:app --reload",
+        "/agent ",
     ];
 
     match command {
@@ -2317,37 +2446,17 @@ fn render_agent_chat_output(ui: &mut egui::Ui, chat: &AgentChatBox) {
             );
         }
         AgentChatStatus::Success | AgentChatStatus::Error => {
-            let full_text = &chat.response;
-            let visible_chars = typewriter_visible_chars(chat, full_text);
-            let visible_text = prefix_chars(full_text, visible_chars);
-            if visible_chars < full_text.chars().count() {
-                ui.ctx().request_repaint_after(Duration::from_millis(16));
-            }
             render_ai_markdown(
                 ui,
-                &visible_text,
+                &chat.response,
                 chat.status == AgentChatStatus::Error,
             );
         }
     }
 }
 
-fn typewriter_visible_chars(chat: &AgentChatBox, text: &str) -> usize {
-    let total = text.chars().count();
-    let Some(completed_at) = chat.completed_at else {
-        return 0;
-    };
-    let chars_per_second = 90.0;
-    let elapsed = completed_at.elapsed().as_secs_f32();
-    let visible = (elapsed * chars_per_second).ceil() as usize;
-    visible.min(total)
-}
-
-fn prefix_chars(text: &str, count: usize) -> String {
-    text.chars().take(count).collect()
-}
-
 fn render_ai_markdown(ui: &mut egui::Ui, text: &str, is_error: bool) {
+    let text = normalize_markdown_text(text);
     let base_color = if is_error {
         color(255, 128, 128)
     } else {
@@ -2478,23 +2587,39 @@ fn render_ai_markdown(ui: &mut egui::Ui, text: &str, is_error: bool) {
                 render_markdown_paragraph(ui, &paragraph_lines, base_color, code_bg, is_error);
                 paragraph_lines.clear();
             }
-            Frame::new()
-                .fill(color(18, 19, 22))
-                .inner_margin(Margin::symmetric(10, 8))
-                .stroke(Stroke::new(1.0, color(44, 47, 54)))
-                .show(ui, |ui| {
-                    ui.add(
-                        egui::Label::new(inline_markdown_job(
-                            quote,
-                            base_color,
-                            code_bg,
-                            false,
-                            12.0,
-                            is_error,
-                        ))
-                        .wrap(),
-                    );
-                });
+            ui.horizontal_wrapped(|ui| {
+                ui.label(
+                    RichText::new(">")
+                        .family(FontFamily::Monospace)
+                        .size(12.0)
+                        .color(bullet_color),
+                );
+                ui.add(
+                    egui::Label::new(inline_markdown_job(
+                        quote,
+                        base_color,
+                        code_bg,
+                        false,
+                        12.0,
+                        is_error,
+                    ))
+                    .wrap(),
+                );
+            });
+            continue;
+        }
+
+        if looks_like_markdown_table_row(trimmed) {
+            if !paragraph_lines.is_empty() {
+                render_markdown_paragraph(ui, &paragraph_lines, base_color, code_bg, is_error);
+                paragraph_lines.clear();
+            }
+            ui.label(
+                RichText::new(trimmed)
+                    .family(FontFamily::Monospace)
+                    .size(12.0)
+                    .color(base_color),
+            );
             continue;
         }
 
@@ -2531,6 +2656,16 @@ fn render_markdown_paragraph(
     );
 }
 
+fn normalize_markdown_text(text: &str) -> String {
+    text.chars()
+        .map(|ch| match ch {
+            '\u{00A0}' | '\u{2000}'..='\u{200B}' | '\u{202F}' | '\u{205F}' | '\u{3000}' => ' ',
+            '\r' => ' ',
+            _ => ch,
+        })
+        .collect()
+}
+
 fn parse_markdown_heading(line: &str) -> Option<(usize, &str)> {
     for level in 1..=3 {
         let marker = format!("{} ", "#".repeat(level));
@@ -2559,6 +2694,10 @@ fn parse_markdown_list_item_ascii(line: &str) -> Option<(String, &str)> {
     }
 
     None
+}
+
+fn looks_like_markdown_table_row(line: &str) -> bool {
+    line.matches('|').count() >= 2
 }
 
 #[allow(dead_code)]
@@ -2629,7 +2768,6 @@ fn append_inline_markdown(
         } else {
             color(244, 246, 248)
         },
-        background: code_bg,
         ..Default::default()
     };
     let link_color = if is_error {
@@ -2934,7 +3072,11 @@ fn render_diff_navigation_panel(
                     for file in diff_files {
                         let is_selected = selected_diff_file.as_ref() == Some(&file.path);
                         if diff_file_row(ui, file, is_selected).clicked() {
-                            *selected_diff_file = Some(file.path.clone());
+                            if is_selected {
+                                *selected_diff_file = None;
+                            } else {
+                                *selected_diff_file = Some(file.path.clone());
+                            }
                         }
                     }
                 });
@@ -2954,7 +3096,18 @@ fn render_diff_navigation_panel(
 
 fn diff_file_row(ui: &mut egui::Ui, file: &DiffFileEntry, selected: bool) -> egui::Response {
     let desired = Vec2::new(ui.available_width(), 30.0);
-    let (rect, response) = ui.allocate_exact_size(desired, egui::Sense::click());
+    let (rect, _) = ui.allocate_exact_size(desired, egui::Sense::hover());
+    let font = FontId::new(11.0, FontFamily::Monospace);
+    let text_width = text_width(ui, &file.path, &font);
+    let button_rect = egui::Rect::from_min_size(
+        rect.min + Vec2::new(6.0, 4.0),
+        Vec2::new((text_width + 12.0).min(rect.width() - 12.0).max(36.0), 22.0),
+    );
+    let response = ui.interact(
+        button_rect,
+        ui.id().with(("diff_file_row", &file.path)),
+        egui::Sense::click(),
+    );
     let fill = if selected {
         color(37, 40, 48)
     } else if response.hovered() {
@@ -2969,11 +3122,18 @@ fn diff_file_row(ui: &mut egui::Ui, file: &DiffFileEntry, selected: bool) -> egu
         Stroke::new(1.0, color(44, 47, 54)),
         StrokeKind::Outside,
     );
+    if response.hovered() || selected {
+        ui.painter().rect_filled(
+            button_rect,
+            CornerRadius::ZERO,
+            if selected { color(48, 52, 62) } else { color(37, 40, 48) },
+        );
+    }
     ui.painter().text(
         rect.min + Vec2::new(10.0, 7.0),
         Align2::LEFT_TOP,
         &file.path,
-        FontId::new(11.0, FontFamily::Monospace),
+        font,
         color(223, 226, 230),
     );
     response
@@ -3025,6 +3185,26 @@ fn load_diff_patch_for_file(directory: &str, relative_path: &str) -> String {
         .unwrap_or_default()
 }
 
+struct SyntaxHighlightResources {
+    syntax_set: SyntaxSet,
+    theme: Theme,
+}
+
+fn syntax_highlight_resources() -> &'static SyntaxHighlightResources {
+    static RESOURCES: OnceLock<SyntaxHighlightResources> = OnceLock::new();
+    RESOURCES.get_or_init(|| {
+        let syntax_set = SyntaxSet::load_defaults_newlines();
+        let themes = ThemeSet::load_defaults();
+        let theme = themes
+            .themes
+            .get("base16-ocean.dark")
+            .or_else(|| themes.themes.values().next())
+            .cloned()
+            .unwrap_or_default();
+        SyntaxHighlightResources { syntax_set, theme }
+    })
+}
+
 fn highlight_diff_patch(text: &str) -> LayoutJob {
     let mut job = LayoutJob::default();
     let default = TextFormat {
@@ -3032,48 +3212,33 @@ fn highlight_diff_patch(text: &str) -> LayoutJob {
         color: color(222, 225, 230),
         ..Default::default()
     };
-    let header = TextFormat {
-        color: color(132, 208, 255),
-        ..default.clone()
-    };
-    let hunk = TextFormat {
-        color: color(255, 208, 102),
-        ..default.clone()
-    };
-    let added = TextFormat {
-        color: color(123, 216, 143),
-        ..default.clone()
-    };
-    let removed = TextFormat {
-        color: color(255, 128, 128),
-        ..default.clone()
-    };
-    let meta = TextFormat {
-        color: color(166, 170, 178),
-        ..default.clone()
-    };
 
-    for line in text.lines() {
-        let format = if line.starts_with("diff --git")
-            || line.starts_with("--- ")
-            || line.starts_with("+++ ")
-            || line.starts_with("index ")
-        {
-            header.clone()
-        } else if line.starts_with("@@") {
-            hunk.clone()
-        } else if line.starts_with('+') && !line.starts_with("+++") {
-            added.clone()
-        } else if line.starts_with('-') && !line.starts_with("---") {
-            removed.clone()
-        } else {
-            meta.clone()
-        };
-        job.append(line, 0.0, format);
-        job.append("\n", 0.0, default.clone());
+    let resources = syntax_highlight_resources();
+    let syntax = resources
+        .syntax_set
+        .find_syntax_by_extension("diff")
+        .unwrap_or_else(|| resources.syntax_set.find_syntax_plain_text());
+    let mut highlighter = HighlightLines::new(syntax, &resources.theme);
+
+    for line in LinesWithEndings::from(text) {
+        match highlighter.highlight_line(line, &resources.syntax_set) {
+            Ok(ranges) => {
+                for (style, part) in ranges {
+                    job.append(part, 0.0, syntax_text_format(style, &default));
+                }
+            }
+            Err(_) => job.append(line, 0.0, default.clone()),
+        }
     }
 
     job
+}
+
+fn syntax_text_format(style: Style, default: &TextFormat) -> TextFormat {
+    TextFormat {
+        color: Color32::from_rgb(style.foreground.r, style.foreground.g, style.foreground.b),
+        ..default.clone()
+    }
 }
 
 fn file_language_label(path: &str) -> &'static str {
@@ -3243,51 +3408,124 @@ fn compose_directory_change_command(directory: &str) -> String {
     }
 }
 
-fn execute_command_request(request: &CommandExecutionRequest) -> CommandExecutionResult {
-    let output = if cfg!(target_os = "windows") {
-        Command::new("powershell.exe")
-            .args(["-NoLogo", "-NoProfile", "-Command", &request.command])
-            .current_dir(&request.working_directory)
-            .output()
+fn execute_command_request(request: &CommandExecutionRequest, result_tx: &Sender<CommandExecutionResult>) {
+    let mut command = if cfg!(target_os = "windows") {
+        let mut command = Command::new("powershell.exe");
+        command.args(["-NoLogo", "-NoProfile", "-Command", &request.command]);
+        command
     } else {
-        Command::new("/bin/bash")
-            .args(["-lc", &request.command])
-            .current_dir(&request.working_directory)
-            .output()
+        let mut command = Command::new("/bin/bash");
+        command.args(["-lc", &request.command]);
+        command
     };
 
-    match output {
-        Ok(output) => {
-            let mut rendered = String::new();
-            if !output.stdout.is_empty() {
-                rendered.push_str(String::from_utf8_lossy(&output.stdout).trim_end());
-            }
-            if !output.stderr.is_empty() {
-                if !rendered.is_empty() {
-                    rendered.push('\n');
-                }
-                rendered.push_str(String::from_utf8_lossy(&output.stderr).trim_end());
-            }
-            if rendered.is_empty() {
-                rendered = if output.status.success() {
-                    "Done.".to_owned()
-                } else {
-                    format!("Command exited with status {}", output.status)
-                };
-            }
+    let child = command
+        .current_dir(&request.working_directory)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn();
 
-            CommandExecutionResult {
+    let mut child = match child {
+        Ok(child) => child,
+        Err(error) => {
+            let _ = result_tx.send(CommandExecutionResult {
                 id: request.id,
-                output: rendered,
-                success: output.status.success(),
+                output_chunk: error.to_string(),
+                done: true,
+                success: false,
+            });
+            return;
+        }
+    };
+
+    let (stream_tx, stream_rx) = mpsc::channel::<CommandStreamMessage>();
+    let mut open_streams = 0usize;
+
+    if let Some(stdout) = child.stdout.take() {
+        open_streams += 1;
+        let stream_tx = stream_tx.clone();
+        thread::spawn(move || {
+            stream_reader(stdout, stream_tx);
+        });
+    }
+
+    if let Some(stderr) = child.stderr.take() {
+        open_streams += 1;
+        let stream_tx = stream_tx.clone();
+        thread::spawn(move || {
+            stream_reader(stderr, stream_tx);
+        });
+    }
+
+    drop(stream_tx);
+
+    let mut saw_output = false;
+    while open_streams > 0 {
+        match stream_rx.recv() {
+            Ok(CommandStreamMessage::Chunk(chunk)) => {
+                saw_output = true;
+                let _ = result_tx.send(CommandExecutionResult {
+                    id: request.id,
+                    output_chunk: chunk,
+                    done: false,
+                    success: true,
+                });
+            }
+            Ok(CommandStreamMessage::Closed) => {
+                open_streams = open_streams.saturating_sub(1);
+            }
+            Err(_) => break,
+        }
+    }
+
+    let status = child.wait();
+    match status {
+        Ok(status) => {
+            let final_chunk = if saw_output {
+                String::new()
+            } else if status.success() {
+                "Done.".to_owned()
+            } else {
+                format!("Command exited with status {}", status)
+            };
+            let _ = result_tx.send(CommandExecutionResult {
+                id: request.id,
+                output_chunk: final_chunk,
+                done: true,
+                success: status.success(),
+            });
+        }
+        Err(error) => {
+            let _ = result_tx.send(CommandExecutionResult {
+                id: request.id,
+                output_chunk: error.to_string(),
+                done: true,
+                success: false,
+            });
+        }
+    }
+}
+
+fn stream_reader<R: std::io::Read + Send + 'static>(
+    reader: R,
+    stream_tx: Sender<CommandStreamMessage>,
+) {
+    let mut reader = BufReader::new(reader);
+    let mut buffer = String::new();
+    loop {
+        buffer.clear();
+        match reader.read_line(&mut buffer) {
+            Ok(0) => break,
+            Ok(_) => {
+                let _ = stream_tx.send(CommandStreamMessage::Chunk(buffer.clone()));
+            }
+            Err(error) => {
+                let _ = stream_tx.send(CommandStreamMessage::Chunk(format!("{error}\n")));
+                break;
             }
         }
-        Err(error) => CommandExecutionResult {
-            id: request.id,
-            output: error.to_string(),
-            success: false,
-        },
     }
+    let _ = stream_tx.send(CommandStreamMessage::Closed);
 }
 
 fn drain_command_results(command_executor: &CommandExecutor, entries: &mut [TranscriptEntry]) {
@@ -3318,6 +3556,8 @@ fn execute_agent_request(request: &AgentChatRequest) -> AgentChatResult {
             id: request.id,
             response: "Usage: /agent <prompt>".to_owned(),
             success: false,
+            mode: request.mode,
+            generated_command: None,
         };
     }
 
@@ -3331,6 +3571,8 @@ fn execute_agent_request(request: &AgentChatRequest) -> AgentChatResult {
                     GROQ_API_KEY_ENV, LOCAL_ENV_FILE, GROQ_API_KEY_ENV
                 ),
                 success: false,
+                mode: request.mode,
+                generated_command: None,
             };
         }
     };
@@ -3342,67 +3584,493 @@ fn execute_agent_request(request: &AgentChatRequest) -> AgentChatResult {
                 id: request.id,
                 response: format!("Unable to create the Groq HTTP client: {error}"),
                 success: false,
+                mode: request.mode,
+                generated_command: None,
             };
         }
     };
 
-    let payload = GroqChatRequest {
-        model: GROQ_MODEL.to_owned(),
-        messages: vec![
-            GroqMessage {
-                role: "system".to_owned(),
-                content: AGENT_SYSTEM_PROMPT.to_owned(),
-            },
-            GroqMessage {
-                role: "user".to_owned(),
-                content: request.prompt.clone(),
-            },
-        ],
+    let system_prompt = match request.mode {
+        AgentRequestMode::Chat => AGENT_SYSTEM_PROMPT,
+        AgentRequestMode::Command => AGENT_COMMAND_SYSTEM_PROMPT,
     };
 
-    let response = client
-        .post(GROQ_API_URL)
-        .bearer_auth(api_key)
-        .json(&payload)
-        .send();
+    let mut messages = vec![
+        GroqMessage {
+            role: "system".to_owned(),
+            content: system_prompt.to_owned(),
+        },
+        GroqMessage {
+            role: "user".to_owned(),
+            content: format!(
+                "Current working directory: {}\n\nUser request:\n{}",
+                request.working_directory, request.prompt
+            ),
+        },
+    ];
 
-    match response {
-        Ok(response) => {
-            let status = response.status();
-            if !status.is_success() {
-                let error_text = response.text().unwrap_or_else(|_| "Unknown error".to_owned());
-                return AgentChatResult {
-                    id: request.id,
-                    response: format!("Groq request failed with {}: {}", status, error_text),
-                    success: false,
-                };
-            }
+    for _ in 0..4 {
+        let payload = GroqChatRequest {
+            model: GROQ_MODEL.to_owned(),
+            messages: messages.clone(),
+        };
 
-            match response.json::<GroqChatResponse>() {
-                Ok(body) => AgentChatResult {
-                    id: request.id,
-                    response: body
+        let response = client
+            .post(GROQ_API_URL)
+            .bearer_auth(&api_key)
+            .json(&payload)
+            .send();
+
+        let content = match response {
+            Ok(response) => {
+                let status = response.status();
+                if !status.is_success() {
+                    let error_text =
+                        response.text().unwrap_or_else(|_| "Unknown error".to_owned());
+                    return AgentChatResult {
+                        id: request.id,
+                        response: format!("Groq request failed with {}: {}", status, error_text),
+                        success: false,
+                        mode: request.mode,
+                        generated_command: None,
+                    };
+                }
+
+                match response.json::<GroqChatResponse>() {
+                    Ok(body) => body
                         .choices
                         .into_iter()
                         .next()
                         .map(|choice| choice.message.content.trim().to_owned())
                         .filter(|content| !content.is_empty())
                         .unwrap_or_else(|| "Groq returned an empty response.".to_owned()),
-                    success: true,
-                },
-                Err(error) => AgentChatResult {
+                    Err(error) => {
+                        return AgentChatResult {
+                            id: request.id,
+                            response: format!("Unable to decode the Groq response: {error}"),
+                            success: false,
+                            mode: request.mode,
+                            generated_command: None,
+                        };
+                    }
+                }
+            }
+            Err(error) => {
+                return AgentChatResult {
                     id: request.id,
-                    response: format!("Unable to decode the Groq response: {error}"),
+                    response: format!("Unable to reach Groq: {error}"),
                     success: false,
-                },
+                    mode: request.mode,
+                    generated_command: None,
+                };
+            }
+        };
+
+        if request.mode == AgentRequestMode::Command {
+            let generated_command = extract_generated_command(&content);
+            return AgentChatResult {
+                id: request.id,
+                response: generated_command
+                    .clone()
+                    .unwrap_or_else(|| format!("The AI did not return a runnable command: {content}")),
+                success: generated_command.is_some(),
+                mode: request.mode,
+                generated_command,
+            };
+        }
+
+        if let Some(tool_call) = parse_agent_tool_call(&content) {
+            let tool_result = run_agent_tool(&request.working_directory, tool_call);
+            messages.push(GroqMessage {
+                role: "assistant".to_owned(),
+                content,
+            });
+            messages.push(GroqMessage {
+                role: "user".to_owned(),
+                content: format!(
+                    "Tool result:\n```text\n{}\n```\nIf you have enough information, answer normally in Markdown. Otherwise emit another JSON tool call.",
+                    tool_result.trim_end()
+                ),
+            });
+            continue;
+        }
+
+        return AgentChatResult {
+            id: request.id,
+            response: content,
+            success: true,
+            mode: request.mode,
+            generated_command: None,
+        };
+    }
+
+    AgentChatResult {
+        id: request.id,
+        response: "The agent used too many tool steps without reaching a final answer.".to_owned(),
+        success: false,
+        mode: request.mode,
+        generated_command: None,
+    }
+}
+
+#[derive(Deserialize)]
+struct AgentToolCall {
+    tool: String,
+    command: Option<String>,
+    path: Option<String>,
+    new_path: Option<String>,
+    content: Option<String>,
+    from: Option<String>,
+    to: Option<String>,
+}
+
+fn parse_agent_tool_call(content: &str) -> Option<AgentToolCall> {
+    serde_json::from_str::<AgentToolCall>(content).ok()
+}
+
+fn extract_generated_command(content: &str) -> Option<String> {
+    let trimmed = content.trim();
+    if trimmed.is_empty() || trimmed.starts_with('{') {
+        return None;
+    }
+
+    let unwrapped = trimmed
+        .strip_prefix("```")
+        .and_then(|rest| rest.split_once('\n').map(|(_, body)| body))
+        .and_then(|body| body.rsplit_once("```").map(|(body, _)| body.trim()))
+        .unwrap_or(trimmed);
+
+    let command = unwrapped.lines().next()?.trim();
+    if command.is_empty() {
+        None
+    } else {
+        Some(command.to_owned())
+    }
+}
+
+fn run_agent_tool(working_directory: &str, call: AgentToolCall) -> String {
+    match call.tool.as_str() {
+        "shell" => {
+            let Some(command) = call.command else {
+                return "Tool error: missing `command` for shell tool.".to_owned();
+            };
+            execute_shell_tool(working_directory, &command)
+        }
+        "read_file" => {
+            let Some(path) = call.path else {
+                return "Tool error: missing `path` for read_file tool.".to_owned();
+            };
+            execute_read_file_tool(working_directory, &path)
+        }
+        "write_file" => {
+            let Some(path) = call.path else {
+                return "Tool error: missing `path` for write_file tool.".to_owned();
+            };
+            let Some(content) = call.content else {
+                return "Tool error: missing `content` for write_file tool.".to_owned();
+            };
+            execute_write_file_tool(working_directory, &path, &content)
+        }
+        "append_file" => {
+            let Some(path) = call.path else {
+                return "Tool error: missing `path` for append_file tool.".to_owned();
+            };
+            let Some(content) = call.content else {
+                return "Tool error: missing `content` for append_file tool.".to_owned();
+            };
+            execute_append_file_tool(working_directory, &path, &content)
+        }
+        "replace_in_file" => {
+            let Some(path) = call.path else {
+                return "Tool error: missing `path` for replace_in_file tool.".to_owned();
+            };
+            let Some(from) = call.from else {
+                return "Tool error: missing `from` for replace_in_file tool.".to_owned();
+            };
+            let Some(to) = call.to else {
+                return "Tool error: missing `to` for replace_in_file tool.".to_owned();
+            };
+            execute_replace_in_file_tool(working_directory, &path, &from, &to)
+        }
+        "list_dir" => execute_list_dir_tool(working_directory, call.path.as_deref()),
+        "mkdir" => {
+            let Some(path) = call.path else {
+                return "Tool error: missing `path` for mkdir tool.".to_owned();
+            };
+            execute_mkdir_tool(working_directory, &path)
+        }
+        "rename_path" => {
+            let Some(path) = call.path else {
+                return "Tool error: missing `path` for rename_path tool.".to_owned();
+            };
+            let Some(new_path) = call.new_path else {
+                return "Tool error: missing `new_path` for rename_path tool.".to_owned();
+            };
+            execute_rename_path_tool(working_directory, &path, &new_path)
+        }
+        "delete_path" => {
+            let Some(path) = call.path else {
+                return "Tool error: missing `path` for delete_path tool.".to_owned();
+            };
+            execute_delete_path_tool(working_directory, &path)
+        }
+        "file_info" => {
+            let Some(path) = call.path else {
+                return "Tool error: missing `path` for file_info tool.".to_owned();
+            };
+            execute_file_info_tool(working_directory, &path)
+        }
+        "git_status" => execute_git_status_tool(working_directory),
+        "git_diff" => execute_git_diff_tool(working_directory, call.path.as_deref()),
+        other => format!("Tool error: unsupported tool `{other}`."),
+    }
+}
+
+fn execute_shell_tool(working_directory: &str, command: &str) -> String {
+    let output = if cfg!(target_os = "windows") {
+        Command::new("powershell.exe")
+            .args(["-NoLogo", "-NoProfile", "-Command", command])
+            .current_dir(working_directory)
+            .output()
+    } else {
+        Command::new("/bin/bash")
+            .args(["-lc", command])
+            .current_dir(working_directory)
+            .output()
+    };
+
+    match output {
+        Ok(output) => {
+            let mut rendered = String::new();
+            if !output.stdout.is_empty() {
+                rendered.push_str(&String::from_utf8_lossy(&output.stdout));
+            }
+            if !output.stderr.is_empty() {
+                if !rendered.is_empty() && !rendered.ends_with('\n') {
+                    rendered.push('\n');
+                }
+                rendered.push_str(&String::from_utf8_lossy(&output.stderr));
+            }
+            if rendered.trim().is_empty() {
+                format!("Command finished with status {}", output.status)
+            } else {
+                rendered
             }
         }
-        Err(error) => AgentChatResult {
-            id: request.id,
-            response: format!("Unable to reach Groq: {error}"),
-            success: false,
-        },
+        Err(error) => format!("Tool error: {error}"),
     }
+}
+
+fn execute_read_file_tool(working_directory: &str, path: &str) -> String {
+    let full_path = match resolve_agent_relative_path(working_directory, path) {
+        Ok(path) => path,
+        Err(error) => return error,
+    };
+    match fs::read_to_string(&full_path) {
+        Ok(contents) => {
+            truncate_agent_tool_output(contents)
+        }
+        Err(error) => format!("Tool error: {error}"),
+    }
+}
+
+fn execute_write_file_tool(working_directory: &str, path: &str, content: &str) -> String {
+    let full_path = match resolve_agent_relative_path(working_directory, path) {
+        Ok(path) => path,
+        Err(error) => return error,
+    };
+    if let Some(parent) = full_path.parent() {
+        if let Err(error) = fs::create_dir_all(parent) {
+            return format!("Tool error: {error}");
+        }
+    }
+    match fs::write(&full_path, content) {
+        Ok(_) => format!("Wrote {} bytes to {}", content.len(), full_path.display()),
+        Err(error) => format!("Tool error: {error}"),
+    }
+}
+
+fn execute_append_file_tool(working_directory: &str, path: &str, content: &str) -> String {
+    let full_path = match resolve_agent_relative_path(working_directory, path) {
+        Ok(path) => path,
+        Err(error) => return error,
+    };
+    if let Some(parent) = full_path.parent() {
+        if let Err(error) = fs::create_dir_all(parent) {
+            return format!("Tool error: {error}");
+        }
+    }
+    match fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&full_path)
+    {
+        Ok(mut file) => match std::io::Write::write_all(&mut file, content.as_bytes()) {
+            Ok(_) => format!("Appended {} bytes to {}", content.len(), full_path.display()),
+            Err(error) => format!("Tool error: {error}"),
+        },
+        Err(error) => format!("Tool error: {error}"),
+    }
+}
+
+fn execute_replace_in_file_tool(
+    working_directory: &str,
+    path: &str,
+    from: &str,
+    to: &str,
+) -> String {
+    let full_path = match resolve_agent_relative_path(working_directory, path) {
+        Ok(path) => path,
+        Err(error) => return error,
+    };
+    let contents = match fs::read_to_string(&full_path) {
+        Ok(contents) => contents,
+        Err(error) => return format!("Tool error: {error}"),
+    };
+    if !contents.contains(from) {
+        return "Tool error: target text not found in file.".to_owned();
+    }
+    let replaced = contents.replacen(from, to, 1);
+    match fs::write(&full_path, replaced) {
+        Ok(_) => format!("Replaced text in {}", full_path.display()),
+        Err(error) => format!("Tool error: {error}"),
+    }
+}
+
+fn execute_list_dir_tool(working_directory: &str, path: Option<&str>) -> String {
+    let full_path = match path {
+        Some(path) => match resolve_agent_relative_path(working_directory, path) {
+            Ok(path) => path,
+            Err(error) => return error,
+        },
+        None => PathBuf::from(working_directory),
+    };
+    let entries = match fs::read_dir(&full_path) {
+        Ok(entries) => entries,
+        Err(error) => return format!("Tool error: {error}"),
+    };
+    let mut rows = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let file_type = if path.is_dir() { "dir" } else { "file" };
+        let name = path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("<invalid>");
+        rows.push(format!("{file_type}\t{name}"));
+    }
+    rows.sort();
+    if rows.is_empty() {
+        "Directory is empty.".to_owned()
+    } else {
+        truncate_agent_tool_output(rows.join("\n"))
+    }
+}
+
+fn execute_mkdir_tool(working_directory: &str, path: &str) -> String {
+    let full_path = match resolve_agent_relative_path(working_directory, path) {
+        Ok(path) => path,
+        Err(error) => return error,
+    };
+    match fs::create_dir_all(&full_path) {
+        Ok(_) => format!("Created directory {}", full_path.display()),
+        Err(error) => format!("Tool error: {error}"),
+    }
+}
+
+fn execute_rename_path_tool(working_directory: &str, path: &str, new_path: &str) -> String {
+    let from_path = match resolve_agent_relative_path(working_directory, path) {
+        Ok(path) => path,
+        Err(error) => return error,
+    };
+    let to_path = match resolve_agent_relative_path(working_directory, new_path) {
+        Ok(path) => path,
+        Err(error) => return error,
+    };
+    if let Some(parent) = to_path.parent() {
+        if let Err(error) = fs::create_dir_all(parent) {
+            return format!("Tool error: {error}");
+        }
+    }
+    match fs::rename(&from_path, &to_path) {
+        Ok(_) => format!("Moved {} to {}", from_path.display(), to_path.display()),
+        Err(error) => format!("Tool error: {error}"),
+    }
+}
+
+fn execute_delete_path_tool(working_directory: &str, path: &str) -> String {
+    let full_path = match resolve_agent_relative_path(working_directory, path) {
+        Ok(path) => path,
+        Err(error) => return error,
+    };
+    let result = if full_path.is_dir() {
+        fs::remove_dir_all(&full_path)
+    } else {
+        fs::remove_file(&full_path)
+    };
+    match result {
+        Ok(_) => format!("Deleted {}", full_path.display()),
+        Err(error) => format!("Tool error: {error}"),
+    }
+}
+
+fn execute_file_info_tool(working_directory: &str, path: &str) -> String {
+    let full_path = match resolve_agent_relative_path(working_directory, path) {
+        Ok(path) => path,
+        Err(error) => return error,
+    };
+    match fs::metadata(&full_path) {
+        Ok(metadata) => format!(
+            "path: {}\ntype: {}\nsize: {}\nreadonly: {}",
+            full_path.display(),
+            if metadata.is_dir() { "dir" } else { "file" },
+            metadata.len(),
+            metadata.permissions().readonly()
+        ),
+        Err(error) => format!("Tool error: {error}"),
+    }
+}
+
+fn execute_git_status_tool(working_directory: &str) -> String {
+    truncate_agent_tool_output(
+        command_stdout(&["git", "-C", working_directory, "status", "--short", "--branch"])
+            .unwrap_or_else(|| "Tool error: unable to run git status.".to_owned()),
+    )
+}
+
+fn execute_git_diff_tool(working_directory: &str, path: Option<&str>) -> String {
+    let mut args = vec!["git", "-C", working_directory, "diff", "--no-color"];
+    let owned_path;
+    if let Some(path) = path {
+        owned_path = path.to_owned();
+        args.push("--");
+        args.push(&owned_path);
+    }
+    truncate_agent_tool_output(
+        command_stdout(&args).unwrap_or_else(|| "Tool error: unable to run git diff.".to_owned()),
+    )
+}
+
+fn resolve_agent_relative_path(working_directory: &str, path: &str) -> Result<PathBuf, String> {
+    let candidate = Path::new(path);
+    if candidate.is_absolute() {
+        return Err("Tool error: absolute paths are not allowed.".to_owned());
+    }
+    if candidate
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir | std::path::Component::Prefix(_) | std::path::Component::RootDir))
+    {
+        return Err("Tool error: paths must stay inside the current working directory.".to_owned());
+    }
+    Ok(Path::new(working_directory).join(candidate))
+}
+
+fn truncate_agent_tool_output(mut text: String) -> String {
+    if text.len() > 24_000 {
+        text.truncate(24_000);
+        text.push_str("\n...<truncated>...");
+    }
+    text
 }
 
 fn load_groq_api_key() -> Option<String> {
@@ -3447,7 +4115,7 @@ struct GroqChatRequest {
     messages: Vec<GroqMessage>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct GroqMessage {
     role: String,
     content: String,
@@ -3528,18 +4196,111 @@ fn read_branch_for_directory(directory: &str) -> String {
 }
 
 fn display_tab_path(directory: &str) -> String {
-    let normalized = directory.replace('/', "\\");
-    let lower = normalized.to_lowercase();
-    if let Some(index) = lower.find("\\documents\\") {
-        return format!("~{}", &normalized[index..]);
+    directory.replace('/', "\\")
+}
+
+fn trailing_tab_path_for_width(ui: &egui::Ui, directory: &str, font: &FontId, max_width: f32) -> String {
+    let normalized = display_tab_path(directory);
+    if text_width(ui, &normalized, font) <= max_width {
+        return normalized;
     }
-    if let Some(index) = lower.find("\\documents") {
-        return format!("~{}", &normalized[index..]);
+
+    let parts: Vec<&str> = normalized
+        .split('\\')
+        .filter(|part| !part.is_empty())
+        .collect();
+    let mut suffix = String::new();
+
+    for part in parts.iter().rev() {
+        let candidate = if suffix.is_empty() {
+            (*part).to_owned()
+        } else {
+            format!("{part}\\{suffix}")
+        };
+        let faded_candidate = format!("...\\{candidate}");
+        if text_width(ui, &faded_candidate, font) > max_width {
+            break;
+        }
+        suffix = candidate;
     }
-    if let Some(index) = normalized.rfind('\\') {
-        return format!("~\\{}", &normalized[index + 1..]);
+
+    if suffix.is_empty() {
+        fit_text_from_end(ui, &normalized, font, max_width)
+    } else if suffix == normalized {
+        suffix
+    } else {
+        format!("...\\{suffix}")
     }
-    format!("~\\{}", normalized)
+}
+
+fn fit_text_from_end(ui: &egui::Ui, text: &str, font: &FontId, max_width: f32) -> String {
+    let mut suffix = String::new();
+    for ch in text.chars().rev() {
+        let candidate = format!("{ch}{suffix}");
+        if text_width(ui, &format!("...{candidate}"), font) > max_width {
+            break;
+        }
+        suffix = candidate;
+    }
+    format!("...{suffix}")
+}
+
+fn text_width(ui: &egui::Ui, text: &str, font: &FontId) -> f32 {
+    ui.painter()
+        .layout_no_wrap(text.to_owned(), font.clone(), Color32::WHITE)
+        .size()
+        .x
+}
+
+fn paint_tab_path(ui: &egui::Ui, rect: egui::Rect, directory: &str) {
+    let font = FontId::proportional(9.5);
+    let shown_path = trailing_tab_path_for_width(ui, directory, &font, rect.width().max(24.0));
+    let path_color = color(138, 142, 149);
+    let fade_color = Color32::from_rgba_unmultiplied(path_color.r(), path_color.g(), path_color.b(), 72);
+
+    if let Some(rest) = shown_path.strip_prefix("...\\") {
+        let fade = "...\\";
+        ui.painter().text(
+            rect.min,
+            Align2::LEFT_TOP,
+            fade,
+            font.clone(),
+            fade_color,
+        );
+        let fade_width = text_width(ui, fade, &font);
+        ui.painter().text(
+            rect.min + Vec2::new(fade_width, 0.0),
+            Align2::LEFT_TOP,
+            rest,
+            font,
+            path_color,
+        );
+    } else if let Some(rest) = shown_path.strip_prefix("...") {
+        let fade = "...";
+        ui.painter().text(
+            rect.min,
+            Align2::LEFT_TOP,
+            fade,
+            font.clone(),
+            fade_color,
+        );
+        let fade_width = text_width(ui, fade, &font);
+        ui.painter().text(
+            rect.min + Vec2::new(fade_width, 0.0),
+            Align2::LEFT_TOP,
+            rest,
+            font,
+            path_color,
+        );
+    } else {
+        ui.painter().text(
+            rect.min,
+            Align2::LEFT_TOP,
+            shown_path,
+            font,
+            path_color,
+        );
+    }
 }
 
 fn default_tab_icon() -> TabIcon {
@@ -3660,13 +4421,11 @@ fn tab_card(ui: &mut egui::Ui, tab: &SearchTab, selected: bool) -> TabCardOutput
         FontId::proportional(9.5),
         color(154, 158, 165),
     );
-    ui.painter().text(
-        card_rect.min + Vec2::new(34.0, 24.0),
-        Align2::LEFT_TOP,
-        display_tab_path(&tab.directory),
-        FontId::proportional(9.5),
-        color(138, 142, 149),
+    let path_rect = egui::Rect::from_min_size(
+        card_rect.min + Vec2::new(10.0, 24.0),
+        Vec2::new((card_rect.width() - 20.0).max(24.0), 14.0),
     );
+    paint_tab_path(ui, path_rect, &tab.directory);
 
     let close_rect = egui::Rect::from_min_size(
         egui::pos2(card_rect.right() - 28.0, card_rect.top() + 5.0),
@@ -3678,7 +4437,7 @@ fn tab_card(ui: &mut egui::Ui, tab: &SearchTab, selected: bool) -> TabCardOutput
     }
 
     TabCardOutput {
-        response,
+        response: response.on_hover_text(display_tab_path(&tab.directory)),
         close_clicked: close_response.clicked(),
     }
 }
