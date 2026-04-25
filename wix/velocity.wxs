@@ -8,7 +8,7 @@
     <MajorUpgrade DowngradeErrorMessage="A newer version of Velocity is already installed." />
     <MediaTemplate EmbedCab="yes" />
 
-    <Icon Id="VelocityIcon" SourceFile="assets\icon.ico" />
+    <Icon Id="VelocityIcon" SourceFile="assets\velocity.ico" />
     <Property Id="ARPPRODUCTICON" Value="VelocityIcon" />
 
     <StandardDirectory Id="ProgramFiles64Folder">

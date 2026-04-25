@@ -51,7 +51,7 @@ jobs:
           mkdir -p "${APP_DIR}/Contents/MacOS" "${APP_DIR}/Contents/Resources"
           cp "target/${{ matrix.target }}/release/velocity" "${APP_DIR}/Contents/MacOS/Velocity"
           chmod +x "${APP_DIR}/Contents/MacOS/Velocity"
-          cp assets/icon.ico "${APP_DIR}/Contents/Resources/icon.ico"
+          cp assets/velocity.ico "${APP_DIR}/Contents/Resources/velocity.ico"
 
           cat > "${APP_DIR}/Contents/Info.plist" <<'PLIST'
           <?xml version="1.0" encoding="UTF-8"?>
@@ -63,7 +63,7 @@ jobs:
             <key>CFBundleExecutable</key>
             <string>Velocity</string>
             <key>CFBundleIconFile</key>
-            <string>icon.ico</string>
+            <string>velocity.ico</string>
             <key>CFBundleIdentifier</key>
             <string>dev.wafee.velocity</string>
             <key>CFBundleName</key>

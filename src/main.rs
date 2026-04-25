@@ -61,7 +61,7 @@ fn main() -> eframe::Result<()> {
 
 fn app_icon() -> Option<egui::IconData> {
     let image = image::load_from_memory_with_format(
-        include_bytes!("../assets/icon.ico"),
+        include_bytes!("../assets/velocity.ico"),
         image::ImageFormat::Ico,
     )
     .ok()?
@@ -1589,15 +1589,45 @@ fn terminal_worker(
 
 fn default_shell_command() -> Vec<OsString> {
     if cfg!(target_os = "windows") {
-        vec![
-            OsString::from("powershell.exe"),
-            OsString::from("-NoLogo"),
-            OsString::from("-NoProfile"),
-        ]
+        let mut command = vec![windows_powershell_program()];
+        command.extend(windows_powershell_args().map(OsString::from));
+        command
     } else if let Ok(shell) = std::env::var("SHELL") {
         vec![OsString::from(shell)]
     } else {
         vec![OsString::from("/bin/bash")]
+    }
+}
+
+fn windows_powershell_program() -> OsString {
+    let system_root =
+        std::env::var_os("SystemRoot").unwrap_or_else(|| OsString::from("C:\\Windows"));
+    let powershell_path = PathBuf::from(system_root)
+        .join("System32")
+        .join("WindowsPowerShell")
+        .join("v1.0")
+        .join("powershell.exe");
+    if powershell_path.exists() {
+        powershell_path.into_os_string()
+    } else {
+        OsString::from("powershell.exe")
+    }
+}
+
+fn windows_powershell_args() -> impl Iterator<Item = &'static str> {
+    ["-NoLogo", "-NoProfile"].into_iter()
+}
+
+fn shell_command_for_script(script: &str) -> Command {
+    if cfg!(target_os = "windows") {
+        let mut command = Command::new(windows_powershell_program());
+        command.args(windows_powershell_args());
+        command.args(["-Command", script]);
+        command
+    } else {
+        let mut command = Command::new("/bin/bash");
+        command.args(["-lc", script]);
+        command
     }
 }
 
@@ -2031,26 +2061,13 @@ fn paint_command_context_boxes(
 }
 
 fn paint_branch_badge_icon(painter: &egui::Painter, rect: egui::Rect, color: Color32) {
-    let stroke = Stroke::new(1.35, color);
-    let radius = (rect.width().min(rect.height()) * 0.16).clamp(1.5, 2.0);
-    let main_x = rect.left() + rect.width() * 0.28;
-    let branch_x = rect.right() - rect.width() * 0.22;
-    let top = egui::pos2(main_x, rect.top() + rect.height() * 0.2);
-    let bottom = egui::pos2(main_x, rect.bottom() - rect.height() * 0.2);
-    let branch = egui::pos2(branch_x, rect.top() + rect.height() * 0.38);
-    let junction = egui::pos2(main_x, rect.center().y);
-
-    painter.line_segment(
-        [
-            top + Vec2::new(0.0, radius),
-            bottom - Vec2::new(0.0, radius),
-        ],
-        stroke,
+    painter.text(
+        rect.center(),
+        Align2::CENTER_CENTER,
+        "\u{e0a0}",
+        FontId::new(rect.height() * 1.15, FontFamily::Monospace),
+        color,
     );
-    painter.line_segment([junction, egui::pos2(branch.x - radius, branch.y)], stroke);
-    painter.circle_stroke(top, radius, stroke);
-    painter.circle_stroke(bottom, radius, stroke);
-    painter.circle_stroke(branch, radius, stroke);
 }
 
 struct BranchPickerOutput {
@@ -3639,7 +3656,22 @@ fn compose_cd_completion(current_input: &str, directory: &str) -> String {
 }
 
 fn looks_interactive_command(command: &str) -> bool {
-    let first = command
+    let trimmed = command.trim();
+    let lower = trimmed.to_lowercase();
+    if lower.starts_with("npm run ")
+        || lower.starts_with("pnpm ")
+        || lower.starts_with("yarn ")
+        || lower.starts_with("bun ")
+        || lower.starts_with("cargo run")
+        || lower.starts_with("cargo watch")
+        || lower.starts_with("cargo leptos")
+        || lower.starts_with("python -i")
+        || lower.starts_with("python3 -i")
+    {
+        return true;
+    }
+
+    let first = trimmed
         .split_whitespace()
         .next()
         .unwrap_or_default()
@@ -3656,8 +3688,17 @@ fn looks_interactive_command(command: &str) -> bool {
             | "more"
             | "ssh"
             | "top"
+            | "codex"
+            | "claude"
+            | "gemini"
+            | "opencode"
+            | "aider"
+            | "gh"
             | "python"
+            | "python3"
+            | "ipython"
             | "node"
+            | "deno"
             | "irb"
             | "sqlite3"
     )
@@ -3693,15 +3734,7 @@ fn execute_command_request(
     request: &CommandExecutionRequest,
     result_tx: &Sender<CommandExecutionResult>,
 ) {
-    let mut command = if cfg!(target_os = "windows") {
-        let mut command = Command::new("powershell.exe");
-        command.args(["-NoLogo", "-NoProfile", "-Command", &request.command]);
-        command
-    } else {
-        let mut command = Command::new("/bin/bash");
-        command.args(["-lc", &request.command]);
-        command
-    };
+    let mut command = shell_command_for_script(&request.command);
 
     let child = command
         .current_dir(&request.working_directory)
@@ -4112,17 +4145,9 @@ fn run_agent_tool(working_directory: &str, call: AgentToolCall) -> String {
 }
 
 fn execute_shell_tool(working_directory: &str, command: &str) -> String {
-    let output = if cfg!(target_os = "windows") {
-        Command::new("powershell.exe")
-            .args(["-NoLogo", "-NoProfile", "-Command", command])
-            .current_dir(working_directory)
-            .output()
-    } else {
-        Command::new("/bin/bash")
-            .args(["-lc", command])
-            .current_dir(working_directory)
-            .output()
-    };
+    let output = shell_command_for_script(command)
+        .current_dir(working_directory)
+        .output();
 
     match output {
         Ok(output) => {
