@@ -1,0 +1,26 @@
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package
+    Name="Velocity"
+    Manufacturer="wafee-ops"
+    Version="$(var.ProductVersion)"
+    UpgradeCode="8F8492B5-2561-4F37-86CB-2CE6D93C3F4D"
+    Scope="perMachine">
+    <MajorUpgrade DowngradeErrorMessage="A newer version of Velocity is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <Icon Id="VelocityIcon" SourceFile="assets\icon.ico" />
+    <Property Id="ARPPRODUCTICON" Value="VelocityIcon" />
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="Velocity">
+        <Component Id="VelocityExecutable" Guid="13A56493-B5F4-4700-9B06-7BA2DC75324C">
+          <File Id="VelocityExe" Source="$(var.TargetPath)" KeyPath="yes" />
+        </Component>
+      </Directory>
+    </StandardDirectory>
+
+    <Feature Id="MainFeature" Title="Velocity" Level="1">
+      <ComponentRef Id="VelocityExecutable" />
+    </Feature>
+  </Package>
+</Wix>

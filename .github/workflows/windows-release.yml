@@ -32,22 +32,34 @@ jobs:
       - name: Build release binary
         run: cargo build --release --target x86_64-pc-windows-msvc
 
+      - name: Install WiX
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Install WiX tool
+        shell: powershell
+        run: dotnet tool install --global wix --version 5.*
+
       - name: Package app artifact
         shell: powershell
         run: |
-          New-Item -ItemType Directory -Force -Path dist\velocity-windows | Out-Null
-          Copy-Item target\x86_64-pc-windows-msvc\release\velocity.exe dist\velocity-windows\velocity.exe
-          Copy-Item README.md dist\velocity-windows\README.md
-          Copy-Item target\x86_64-pc-windows-msvc\release\velocity.exe dist\velocity-windows.exe
-          Compress-Archive -Path dist\velocity-windows\* -DestinationPath dist\velocity-windows.zip -Force
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item target\x86_64-pc-windows-msvc\release\velocity.exe dist\velocity.exe
+          $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"').Matches.Groups[1].Value
+          wix build wix\velocity.wxs `
+            -d ProductVersion=$version `
+            -d TargetPath=target\x86_64-pc-windows-msvc\release\velocity.exe `
+            -arch x64 `
+            -out dist\velocity.msi
 
       - name: Upload app artifact
         uses: actions/upload-artifact@v4
         with:
           name: velocity-windows
           path: |
-            dist/velocity-windows.exe
-            dist/velocity-windows.zip
+            dist/velocity.exe
+            dist/velocity.msi
           if-no-files-found: error
 
       - name: Publish release asset
@@ -55,5 +67,5 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            dist/velocity-windows.exe
-            dist/velocity-windows.zip
+            dist/velocity.exe
+            dist/velocity.msi
