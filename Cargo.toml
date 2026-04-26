@@ -5,7 +5,7 @@ edition = "2021"
 default-run = "velocity"
 
 [dependencies]
-eframe = { version = "0.34.1", features = ["wgpu"] }
+eframe = { version = "0.34.1", default-features = false, features = ["default_fonts", "wgpu"] }
 reqwest = { version = "0.12.24", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"

@@ -18,7 +18,7 @@ Then restart your terminal.
 cargo run
 ```
 
-To enable the in-app `/agent` command with Groq, either add your API key to `.env.local`:
+To enable the in-app `/agent` command with Groq, either add your API key to `.env.local` for safety:
 
 ```powershell
 GROQ_API_KEY=your-groq-api-key

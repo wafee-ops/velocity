@@ -160,10 +160,12 @@ struct TerminalSnapshot {
 
 #[derive(Clone)]
 struct SearchTab {
+    id: u64,
     title: String,
     directory: String,
     branch: String,
     icon: TabIcon,
+    transcript_entries: Vec<TranscriptEntry>,
 }
 
 #[derive(Clone, Copy)]
@@ -227,6 +229,10 @@ const AGENT_COMMAND_SYSTEM_PROMPT: &str =
 Return exactly one shell command for the current working directory. \
 Do not include markdown, JSON, explanations, or multiple commands. \
 Choose the most direct command that satisfies the user's request.";
+const COMMIT_MESSAGE_SYSTEM_PROMPT: &str =
+    "You write concise git commit messages. \
+Return exactly one commit message, without quotes, markdown, punctuation wrappers, or explanations. \
+Use imperative mood, keep it under 72 characters, and describe the actual change.";
 
 enum TerminalRequest {
     RunCommand(String),
@@ -253,6 +259,8 @@ struct TerminalPane {
     requested_size: (u16, u16),
     command_input: String,
     command_input_id: egui::Id,
+    history_cursor: Option<usize>,
+    history_draft: String,
 }
 
 struct CommandExecutor {
@@ -288,6 +296,7 @@ enum CommandStreamMessage {
 #[derive(Clone)]
 struct AgentChatRequest {
     id: u64,
+    tab_id: u64,
     prompt: String,
     working_directory: String,
     mode: AgentRequestMode,
@@ -296,6 +305,8 @@ struct AgentChatRequest {
 #[derive(Clone)]
 struct AgentChatResult {
     id: u64,
+    tab_id: u64,
+    working_directory: String,
     response: String,
     success: bool,
     mode: AgentRequestMode,
@@ -306,6 +317,7 @@ struct AgentChatResult {
 enum AgentRequestMode {
     Chat,
     Command,
+    CommitMessage,
 }
 
 #[derive(Clone, Copy)]
@@ -404,6 +416,8 @@ impl TerminalPane {
             requested_size: (120, 32),
             command_input: String::new(),
             command_input_id: egui::Id::new(("terminal_pane_input", index)),
+            history_cursor: None,
+            history_draft: String::new(),
         }
     }
 }
@@ -488,15 +502,17 @@ struct VelocityApp {
     command_input_id: egui::Id,
     refocus_command_input: bool,
     command_history: Vec<String>,
+    command_history_cursor: Option<usize>,
+    command_history_draft: String,
     available_commands: Vec<String>,
     shell_directory: String,
     tabs: Vec<SearchTab>,
     selected_tab: usize,
+    next_tab_id: u64,
     terminals: Vec<TerminalPane>,
     active_terminal: usize,
     command_executor: CommandExecutor,
     agent_executor: AgentExecutor,
-    transcript_entries: Vec<TranscriptEntry>,
     next_command_id: u64,
     input_context: InputContext,
     last_context_refresh: Instant,
@@ -507,6 +523,8 @@ struct VelocityApp {
     pending_branch_refresh_command_id: Option<u64>,
     expanded_file_dirs: BTreeSet<String>,
     selected_file_path: Option<String>,
+    file_editor: Option<FileEditorState>,
+    commit_message_suggestion: Option<CommitMessageSuggestionState>,
 }
 
 struct InputContext {
@@ -521,6 +539,26 @@ struct DiffFileEntry {
     path: String,
 }
 
+struct FileEditorState {
+    path: String,
+    contents: String,
+    error: Option<String>,
+    dirty: bool,
+}
+
+struct CommitMessageSuggestionState {
+    signature: String,
+    request_id: Option<u64>,
+    message: Option<String>,
+    error: Option<String>,
+}
+
+#[derive(Clone, Copy)]
+enum HistoryDirection {
+    Previous,
+    Next,
+}
+
 impl VelocityApp {
     fn new(ctx: egui::Context) -> Self {
         let shell_directory = current_directory_label();
@@ -530,15 +568,17 @@ impl VelocityApp {
             command_input_id: egui::Id::new("command_input"),
             refocus_command_input: false,
             command_history: default_command_history(),
+            command_history_cursor: None,
+            command_history_draft: String::new(),
             available_commands: discover_available_commands(),
             shell_directory: shell_directory.clone(),
             tabs: load_tabs_from_workspace(),
             selected_tab: 0,
+            next_tab_id: 2,
             terminals: vec![TerminalPane::new(ctx.clone(), 0)],
             active_terminal: 0,
             command_executor: CommandExecutor::new(),
             agent_executor: AgentExecutor::new(),
-            transcript_entries: Vec::new(),
             next_command_id: 1,
             input_context: read_input_context_for_directory(&shell_directory),
             last_context_refresh: Instant::now(),
@@ -549,6 +589,48 @@ impl VelocityApp {
             pending_branch_refresh_command_id: None,
             expanded_file_dirs: BTreeSet::from([shell_directory.clone()]),
             selected_file_path: None,
+            file_editor: None,
+            commit_message_suggestion: None,
+        }
+    }
+
+    fn active_tab_id(&self) -> Option<u64> {
+        self.tabs.get(self.selected_tab).map(|tab| tab.id)
+    }
+
+    fn active_transcript_entries(&self) -> &[TranscriptEntry] {
+        self.tabs
+            .get(self.selected_tab)
+            .map(|tab| tab.transcript_entries.as_slice())
+            .unwrap_or(&[])
+    }
+
+    fn push_transcript_entry_to_active_tab(&mut self, entry: TranscriptEntry) {
+        if let Some(tab) = self.tabs.get_mut(self.selected_tab) {
+            tab.transcript_entries.push(entry);
+        }
+    }
+
+    fn push_transcript_entry_to_tab(&mut self, tab_id: u64, entry: TranscriptEntry) {
+        if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == tab_id) {
+            tab.transcript_entries.push(entry);
+        } else if let Some(tab) = self.tabs.get_mut(self.selected_tab) {
+            tab.transcript_entries.push(entry);
+        }
+    }
+
+    fn select_tab(&mut self, index: usize) {
+        if index >= self.tabs.len() {
+            return;
+        }
+        self.selected_tab = index;
+        if let Some(tab) = self.tabs.get(index) {
+            self.shell_directory = tab.directory.clone();
+            self.input_context = read_input_context_for_directory(&self.shell_directory);
+            self.expanded_file_dirs.insert(self.shell_directory.clone());
+            self.selected_file_path = None;
+            self.file_editor = None;
+            self.ensure_selected_diff_file();
         }
     }
 
@@ -558,6 +640,8 @@ impl VelocityApp {
             return;
         }
 
+        self.command_history_cursor = None;
+        self.command_history_draft.clear();
         self.record_command_history(&command);
         if self.try_handle_directory_change(&command) {
             self.command_input.clear();
@@ -577,13 +661,12 @@ impl VelocityApp {
 
         let command_id = self.next_command_id;
         self.next_command_id += 1;
-        self.transcript_entries
-            .push(TranscriptEntry::Command(CommandBlock {
-                id: command_id,
-                command: command.clone(),
-                output: String::new(),
-                status: CommandBlockStatus::Running,
-            }));
+        self.push_transcript_entry_to_active_tab(TranscriptEntry::Command(CommandBlock {
+            id: command_id,
+            command: command.clone(),
+            output: String::new(),
+            status: CommandBlockStatus::Running,
+        }));
         self.command_executor.execute(CommandExecutionRequest {
             id: command_id,
             command,
@@ -598,11 +681,14 @@ impl VelocityApp {
             return;
         }
 
+        self.command_history_cursor = None;
+        self.command_history_draft.clear();
         self.record_command_history(&prompt);
         let request_id = self.next_command_id;
         self.next_command_id += 1;
         self.agent_executor.execute(AgentChatRequest {
             id: request_id,
+            tab_id: self.active_tab_id().unwrap_or(0),
             prompt,
             working_directory: self.shell_directory.clone(),
             mode: AgentRequestMode::Command,
@@ -616,6 +702,69 @@ impl VelocityApp {
             MainInputSubmitMode::AiCommand => self.maybe_send_ai_command(),
         }
         self.refocus_command_input = true;
+    }
+
+    fn navigate_main_command_history(&mut self, direction: HistoryDirection) {
+        let next_input = navigate_command_history(
+            &self.command_input,
+            &self.command_history,
+            &mut self.command_history_cursor,
+            &mut self.command_history_draft,
+            direction,
+        );
+        if let Some(next_input) = next_input {
+            self.command_input = next_input;
+        }
+    }
+
+    fn navigate_terminal_command_history(&mut self, index: usize, direction: HistoryDirection) {
+        let Some(pane) = self.terminals.get_mut(index) else {
+            return;
+        };
+        let next_input = navigate_command_history(
+            &pane.command_input,
+            &self.command_history,
+            &mut pane.history_cursor,
+            &mut pane.history_draft,
+            direction,
+        );
+        if let Some(next_input) = next_input {
+            pane.command_input = next_input;
+        }
+    }
+
+    fn maybe_request_commit_message_suggestion(&mut self, input: &str) {
+        let Some(template) = commit_message_template(input) else {
+            return;
+        };
+        let diff_context = commit_message_diff_context(&self.shell_directory);
+        let signature = format!("{}|{}", template.normalized, diff_context);
+        let existing_matches = self
+            .commit_message_suggestion
+            .as_ref()
+            .is_some_and(|state| state.signature == signature);
+        if existing_matches {
+            return;
+        }
+
+        let request_id = self.next_command_id;
+        self.next_command_id += 1;
+        self.commit_message_suggestion = Some(CommitMessageSuggestionState {
+            signature,
+            request_id: Some(request_id),
+            message: None,
+            error: None,
+        });
+        self.agent_executor.execute(AgentChatRequest {
+            id: request_id,
+            tab_id: self.active_tab_id().unwrap_or(0),
+            prompt: format!(
+                "Generate a commit message for this git worktree.\n\n{}",
+                diff_context
+            ),
+            working_directory: self.shell_directory.clone(),
+            mode: AgentRequestMode::CommitMessage,
+        });
     }
 
     fn forward_terminal_input(&mut self, ctx: &egui::Context) {
@@ -713,6 +862,8 @@ impl VelocityApp {
                     &command,
                 )));
             pane.command_input.clear();
+            pane.history_cursor = None;
+            pane.history_draft.clear();
         }
         self.refocus_terminal_input = Some(index);
     }
@@ -720,26 +871,33 @@ impl VelocityApp {
     fn add_sidebar_tab(&mut self) {
         let raw_value = self.query.trim();
         let new_tab = if raw_value.is_empty() {
-            default_new_tab(&self.tabs)
+            let tab = default_new_tab(&self.tabs, self.next_tab_id);
+            self.next_tab_id += 1;
+            tab
         } else {
             let directory = raw_value.replace('\\', "/");
             let title = unique_tab_title(&self.tabs, &tab_title_from_value(raw_value, &directory));
+            let id = self.next_tab_id;
+            self.next_tab_id += 1;
             SearchTab {
+                id,
                 title,
                 branch: read_branch_for_directory(&directory),
                 directory,
                 icon: tab_icon_for(raw_value),
+                transcript_entries: Vec::new(),
             }
         };
         self.tabs.insert(0, new_tab);
-        self.selected_tab = 0;
+        self.select_tab(0);
         self.query.clear();
     }
 
     fn close_tab(&mut self, index: usize) {
         if self.tabs.len() == 1 {
-            self.tabs[0] = default_new_tab(&[]);
-            self.selected_tab = 0;
+            let id = self.tabs[0].id;
+            self.tabs[0] = default_new_tab(&[], id);
+            self.select_tab(0);
             return;
         }
 
@@ -751,6 +909,7 @@ impl VelocityApp {
         } else if index == self.selected_tab {
             self.selected_tab = self.selected_tab.min(self.tabs.len().saturating_sub(1));
         }
+        self.select_tab(self.selected_tab);
     }
 
     fn refresh_tab_contexts(&mut self) {
@@ -779,13 +938,12 @@ impl VelocityApp {
         else {
             let command_id = self.next_command_id;
             self.next_command_id += 1;
-            self.transcript_entries
-                .push(TranscriptEntry::Command(CommandBlock {
-                    id: command_id,
-                    command: command.to_owned(),
-                    output: format!("Directory not found: {target}"),
-                    status: CommandBlockStatus::Error,
-                }));
+            self.push_transcript_entry_to_active_tab(TranscriptEntry::Command(CommandBlock {
+                id: command_id,
+                command: command.to_owned(),
+                output: format!("Directory not found: {target}"),
+                status: CommandBlockStatus::Error,
+            }));
             return true;
         };
 
@@ -800,13 +958,12 @@ impl VelocityApp {
 
         let command_id = self.next_command_id;
         self.next_command_id += 1;
-        self.transcript_entries
-            .push(TranscriptEntry::Command(CommandBlock {
-                id: command_id,
-                command: command.to_owned(),
-                output: format!("Changed directory to {resolved_directory}"),
-                status: CommandBlockStatus::Success,
-            }));
+        self.push_transcript_entry_to_active_tab(TranscriptEntry::Command(CommandBlock {
+            id: command_id,
+            command: command.to_owned(),
+            output: format!("Changed directory to {resolved_directory}"),
+            status: CommandBlockStatus::Success,
+        }));
         true
     }
 
@@ -818,17 +975,18 @@ impl VelocityApp {
         let chat_id = self.next_command_id;
         self.next_command_id += 1;
         let prompt = prompt.to_owned();
-        self.transcript_entries
-            .push(TranscriptEntry::Agent(AgentChatBox {
-                id: chat_id,
-                prompt: prompt.clone(),
-                response: String::new(),
-                status: AgentChatStatus::Running,
-                created_at: Instant::now(),
-                completed_at: None,
-            }));
+        let tab_id = self.active_tab_id().unwrap_or(0);
+        self.push_transcript_entry_to_active_tab(TranscriptEntry::Agent(AgentChatBox {
+            id: chat_id,
+            prompt: prompt.clone(),
+            response: String::new(),
+            status: AgentChatStatus::Running,
+            created_at: Instant::now(),
+            completed_at: None,
+        }));
         self.agent_executor.execute(AgentChatRequest {
             id: chat_id,
+            tab_id,
             prompt,
             working_directory: self.shell_directory.clone(),
             mode: AgentRequestMode::Chat,
@@ -839,17 +997,19 @@ impl VelocityApp {
     fn apply_agent_result(&mut self, result: AgentChatResult) {
         match result.mode {
             AgentRequestMode::Chat => {
-                for entry in &mut self.transcript_entries {
-                    if let TranscriptEntry::Agent(chat) = entry {
-                        if chat.id == result.id {
-                            chat.response = result.response.clone();
-                            chat.status = if result.success {
-                                AgentChatStatus::Success
-                            } else {
-                                AgentChatStatus::Error
-                            };
-                            chat.completed_at = Some(Instant::now());
-                            break;
+                for tab in &mut self.tabs {
+                    for entry in &mut tab.transcript_entries {
+                        if let TranscriptEntry::Agent(chat) = entry {
+                            if chat.id == result.id {
+                                chat.response = result.response.clone();
+                                chat.status = if result.success {
+                                    AgentChatStatus::Success
+                                } else {
+                                    AgentChatStatus::Error
+                                };
+                                chat.completed_at = Some(Instant::now());
+                                return;
+                            }
                         }
                     }
                 }
@@ -858,28 +1018,46 @@ impl VelocityApp {
                 if let Some(command) = result.generated_command {
                     let command_id = self.next_command_id;
                     self.next_command_id += 1;
-                    self.transcript_entries
-                        .push(TranscriptEntry::Command(CommandBlock {
+                    self.push_transcript_entry_to_tab(
+                        result.tab_id,
+                        TranscriptEntry::Command(CommandBlock {
                             id: command_id,
                             command: command.clone(),
                             output: String::new(),
                             status: CommandBlockStatus::Running,
-                        }));
+                        }),
+                    );
                     self.command_executor.execute(CommandExecutionRequest {
                         id: command_id,
                         command,
-                        working_directory: self.shell_directory.clone(),
+                        working_directory: result.working_directory,
                     });
                 } else {
                     let command_id = self.next_command_id;
                     self.next_command_id += 1;
-                    self.transcript_entries
-                        .push(TranscriptEntry::Command(CommandBlock {
+                    self.push_transcript_entry_to_tab(
+                        result.tab_id,
+                        TranscriptEntry::Command(CommandBlock {
                             id: command_id,
                             command: "AI command generation".to_owned(),
                             output: result.response,
                             status: CommandBlockStatus::Error,
-                        }));
+                        }),
+                    );
+                }
+            }
+            AgentRequestMode::CommitMessage => {
+                if let Some(state) = &mut self.commit_message_suggestion {
+                    if state.request_id == Some(result.id) {
+                        state.request_id = None;
+                        if result.success {
+                            state.message = sanitize_commit_message(&result.response);
+                            state.error = None;
+                        } else {
+                            state.message = None;
+                            state.error = Some(result.response);
+                        }
+                    }
                 }
             }
         }
@@ -914,13 +1092,12 @@ impl VelocityApp {
         let command_id = self.next_command_id;
         self.next_command_id += 1;
         let command = format!("git switch {branch}");
-        self.transcript_entries
-            .push(TranscriptEntry::Command(CommandBlock {
-                id: command_id,
-                command: command.clone(),
-                output: String::new(),
-                status: CommandBlockStatus::Running,
-            }));
+        self.push_transcript_entry_to_active_tab(TranscriptEntry::Command(CommandBlock {
+            id: command_id,
+            command: command.clone(),
+            output: String::new(),
+            status: CommandBlockStatus::Running,
+        }));
         self.command_executor.execute(CommandExecutionRequest {
             id: command_id,
             command,
@@ -935,14 +1112,12 @@ impl VelocityApp {
         let Some(command_id) = self.pending_branch_refresh_command_id else {
             return;
         };
-        let Some(status) = self
-            .transcript_entries
-            .iter()
-            .find_map(|entry| match entry {
+        let Some(status) = self.tabs.iter().find_map(|tab| {
+            tab.transcript_entries.iter().find_map(|entry| match entry {
                 TranscriptEntry::Command(block) if block.id == command_id => Some(block.status),
                 _ => None,
             })
-        else {
+        }) else {
             self.pending_branch_refresh_command_id = None;
             return;
         };
@@ -953,6 +1128,48 @@ impl VelocityApp {
         self.input_context = read_input_context_for_directory(&self.shell_directory);
         self.refresh_tab_contexts();
         self.pending_branch_refresh_command_id = None;
+    }
+
+    fn ensure_file_editor_loaded(&mut self, path: &str) {
+        if self
+            .file_editor
+            .as_ref()
+            .is_some_and(|editor| editor.path == path)
+        {
+            return;
+        }
+
+        let path_buf = PathBuf::from(path);
+        let (contents, error) = match load_file_preview_contents(&path_buf) {
+            Ok(contents) => (contents, None),
+            Err(error) => (String::new(), Some(error)),
+        };
+        self.file_editor = Some(FileEditorState {
+            path: path.to_owned(),
+            contents,
+            error,
+            dirty: false,
+        });
+    }
+
+    fn save_file_editor(&mut self) {
+        let Some(editor) = &mut self.file_editor else {
+            return;
+        };
+        if editor.error.is_some() {
+            return;
+        }
+
+        match fs::write(&editor.path, &editor.contents) {
+            Ok(_) => {
+                editor.dirty = false;
+                self.input_context = read_input_context_for_directory(&self.shell_directory);
+                self.ensure_selected_diff_file();
+            }
+            Err(error) => {
+                editor.error = Some(format!("Unable to save file: {error}"));
+            }
+        }
     }
 
     fn render_search_sidebar(&mut self, ui: &mut egui::Ui) {
@@ -1034,7 +1251,7 @@ impl VelocityApp {
                                 let card =
                                     tab_card(ui, &self.tabs[index], index == self.selected_tab);
                                 if card.response.clicked() {
-                                    self.selected_tab = index;
+                                    self.select_tab(index);
                                 }
                                 if card.close_clicked {
                                     self.close_tab(index);
@@ -1095,6 +1312,24 @@ struct CommandSuggestion {
     completion: String,
 }
 
+struct CommitMessageTemplate {
+    normalized: String,
+    quote_start: usize,
+    quote_end: usize,
+}
+
+impl CommitMessageTemplate {
+    fn complete(&self, message: &str) -> String {
+        let escaped_message = message.replace('"', "'");
+        format!(
+            "{}{}{}",
+            &self.normalized[..self.quote_start],
+            escaped_message,
+            &self.normalized[self.quote_end..]
+        )
+    }
+}
+
 impl eframe::App for VelocityApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         let previous_fingerprints: Vec<String> = self
@@ -1105,7 +1340,7 @@ impl eframe::App for VelocityApp {
         for pane in &mut self.terminals {
             pane.backend.drain_updates(&mut pane.snapshot);
         }
-        drain_command_results(&self.command_executor, &mut self.transcript_entries);
+        drain_command_results_for_tabs(&self.command_executor, &mut self.tabs);
         self.refresh_branch_context_after_switch();
         for result in self.agent_executor.drain_results() {
             self.apply_agent_result(result);
@@ -1212,27 +1447,48 @@ impl eframe::App for VelocityApp {
                     });
 
                     ui.scope_builder(egui::UiBuilder::new().max_rect(transcript_rect), |ui| {
-                        let transcript_height = transcript_rect.height().max(180.0);
-                        ScrollArea::vertical()
-                            .id_salt("command_transcript_scroll")
-                            .auto_shrink([false, false])
-                            .stick_to_bottom(true)
-                            .max_height(transcript_height)
-                            .show(ui, |ui| {
-                                ui.set_min_height(transcript_height);
-                                ui.spacing_mut().item_spacing = Vec2::ZERO;
-                                let estimated_block_height = 86.0;
-                                let bottom_padding = (transcript_height
-                                    - self.transcript_entries.len() as f32
-                                        * estimated_block_height)
-                                    .max(0.0);
-                                if bottom_padding > 0.0 {
-                                    ui.add_space(bottom_padding);
+                        if let Some(path) = self.selected_file_path.clone() {
+                            self.ensure_file_editor_loaded(&path);
+                            let action = if let Some(editor) = &mut self.file_editor {
+                                render_file_preview(ui, editor)
+                            } else {
+                                FilePreviewAction::None
+                            };
+                            match action {
+                                FilePreviewAction::None => {}
+                                FilePreviewAction::Changed => {
+                                    if let Some(editor) = &mut self.file_editor {
+                                        editor.dirty = true;
+                                    }
                                 }
-                                for entry in &self.transcript_entries {
-                                    transcript_entry_card(ui, entry);
+                                FilePreviewAction::Save => {
+                                    self.save_file_editor();
                                 }
-                            });
+                            }
+                        } else {
+                            self.file_editor = None;
+                            let transcript_height = transcript_rect.height().max(180.0);
+                            ScrollArea::vertical()
+                                .id_salt("command_transcript_scroll")
+                                .auto_shrink([false, false])
+                                .stick_to_bottom(true)
+                                .max_height(transcript_height)
+                                .show(ui, |ui| {
+                                    ui.set_min_height(transcript_height);
+                                    ui.spacing_mut().item_spacing = Vec2::ZERO;
+                                    let transcript_entries = self.active_transcript_entries();
+                                    let estimated_block_height = 86.0;
+                                    let bottom_padding = (transcript_height
+                                        - transcript_entries.len() as f32 * estimated_block_height)
+                                        .max(0.0);
+                                    if bottom_padding > 0.0 {
+                                        ui.add_space(bottom_padding);
+                                    }
+                                    for entry in transcript_entries {
+                                        transcript_entry_card(ui, entry);
+                                    }
+                                });
+                        }
                     });
 
                     paint_command_bar(ui, bar_rect);
@@ -1284,11 +1540,18 @@ impl eframe::App for VelocityApp {
                                 }
                             }
 
+                            let command_input = self.command_input.clone();
+                            self.maybe_request_commit_message_suggestion(&command_input);
+                            let commit_message = self
+                                .commit_message_suggestion
+                                .as_ref()
+                                .and_then(|state| state.message.as_deref());
                             let suggestion = command_suggestion(
                                 &self.command_input,
                                 &self.command_history,
                                 &self.available_commands,
                                 &self.shell_directory,
+                                commit_message,
                             );
                             let mut layouter =
                                 |ui: &egui::Ui, text: &dyn TextBuffer, wrap_width: f32| {
@@ -1313,13 +1576,34 @@ impl eframe::App for VelocityApp {
                                 input_response.request_focus();
                                 self.refocus_command_input = false;
                             }
+                            if input_response.changed() {
+                                self.command_history_cursor = None;
+                                self.command_history_draft.clear();
+                            }
                             if input_response.has_focus()
                                 && ui.input(|input| input.key_pressed(egui::Key::Tab))
                             {
                                 if let Some(suggestion) = &suggestion {
                                     self.command_input = suggestion.completion.clone();
+                                    self.command_history_cursor = None;
+                                    self.command_history_draft.clear();
                                     ui.ctx().request_repaint();
                                 }
+                            }
+                            if input_response.has_focus()
+                                && ui.input_mut(|input| {
+                                    input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp)
+                                })
+                            {
+                                self.navigate_main_command_history(HistoryDirection::Previous);
+                                ui.ctx().request_repaint();
+                            } else if input_response.has_focus()
+                                && ui.input_mut(|input| {
+                                    input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown)
+                                })
+                            {
+                                self.navigate_main_command_history(HistoryDirection::Next);
+                                ui.ctx().request_repaint();
                             }
                             if ui.memory(|memory| memory.has_focus(self.command_input_id))
                                 && ui.input_mut(|input| {
@@ -1437,12 +1721,23 @@ impl eframe::App for VelocityApp {
                             egui::UiBuilder::new()
                                 .max_rect(input_rect.shrink2(Vec2::new(10.0, 6.0))),
                             |ui| {
+                                let pane_command_input = self
+                                    .terminals
+                                    .get(index)
+                                    .map(|pane| pane.command_input.clone())
+                                    .unwrap_or_default();
+                                self.maybe_request_commit_message_suggestion(&pane_command_input);
+                                let commit_message = self
+                                    .commit_message_suggestion
+                                    .as_ref()
+                                    .and_then(|state| state.message.as_deref());
                                 let suggestion = self.terminals.get(index).and_then(|pane| {
                                     command_suggestion(
                                         &pane.command_input,
                                         &self.command_history,
                                         &self.available_commands,
                                         &self.shell_directory,
+                                        commit_message,
                                     )
                                 });
                                 let input_response =
@@ -1477,15 +1772,47 @@ impl eframe::App for VelocityApp {
                                     input_response.request_focus();
                                     self.refocus_terminal_input = None;
                                 }
+                                if input_response.changed() {
+                                    if let Some(pane) = self.terminals.get_mut(index) {
+                                        pane.history_cursor = None;
+                                        pane.history_draft.clear();
+                                    }
+                                }
                                 if input_response.has_focus()
                                     && ui.input(|input| input.key_pressed(egui::Key::Tab))
                                 {
                                     if let Some(suggestion) = &suggestion {
                                         if let Some(pane) = self.terminals.get_mut(index) {
                                             pane.command_input = suggestion.completion.clone();
+                                            pane.history_cursor = None;
+                                            pane.history_draft.clear();
                                         }
                                         ui.ctx().request_repaint();
                                     }
+                                }
+                                if input_response.has_focus()
+                                    && ui.input_mut(|input| {
+                                        input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp)
+                                    })
+                                {
+                                    self.navigate_terminal_command_history(
+                                        index,
+                                        HistoryDirection::Previous,
+                                    );
+                                    ui.ctx().request_repaint();
+                                } else if input_response.has_focus()
+                                    && ui.input_mut(|input| {
+                                        input.consume_key(
+                                            egui::Modifiers::NONE,
+                                            egui::Key::ArrowDown,
+                                        )
+                                    })
+                                {
+                                    self.navigate_terminal_command_history(
+                                        index,
+                                        HistoryDirection::Next,
+                                    );
+                                    ui.ctx().request_repaint();
                                 }
                                 if let Some(command_input_id) =
                                     self.terminals.get(index).map(|pane| pane.command_input_id)
@@ -2383,15 +2710,128 @@ fn discover_available_commands() -> Vec<String> {
     commands.into_iter().collect()
 }
 
+fn commit_message_template(input: &str) -> Option<CommitMessageTemplate> {
+    let normalized = input.trim_start().to_owned();
+    if !normalized.starts_with("git commit") {
+        return None;
+    }
+
+    for marker in ["-m \"\"", "--message \"\""] {
+        if let Some(marker_start) = normalized.find(marker) {
+            let quote_start = marker_start + marker.len() - 1;
+            return Some(CommitMessageTemplate {
+                normalized,
+                quote_start,
+                quote_end: quote_start,
+            });
+        }
+    }
+
+    None
+}
+
+fn commit_message_diff_context(directory: &str) -> String {
+    let staged_stat =
+        command_stdout(&["git", "-C", directory, "diff", "--cached", "--stat"]).unwrap_or_default();
+    let staged_files =
+        command_stdout(&["git", "-C", directory, "diff", "--cached", "--name-status"])
+            .unwrap_or_default();
+    let using_staged = !staged_stat.trim().is_empty() || !staged_files.trim().is_empty();
+
+    let (scope, stat, files) = if using_staged {
+        ("staged changes", staged_stat, staged_files)
+    } else {
+        (
+            "unstaged changes",
+            command_stdout(&["git", "-C", directory, "diff", "--stat"]).unwrap_or_default(),
+            command_stdout(&["git", "-C", directory, "diff", "--name-status"]).unwrap_or_default(),
+        )
+    };
+    let branch = command_stdout(&["git", "-C", directory, "branch", "--show-current"])
+        .unwrap_or_else(|| "unknown".to_owned());
+
+    format!(
+        "Branch: {branch}\nScope: {scope}\nDiff stat:\n{}\nChanged files:\n{}",
+        stat.trim(),
+        files.trim()
+    )
+}
+
+fn sanitize_commit_message(response: &str) -> Option<String> {
+    let cleaned = response
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or_default()
+        .trim()
+        .trim_start_matches(['-', '*'])
+        .trim()
+        .trim_matches(['"', '\'', '`'])
+        .trim()
+        .to_owned();
+    if cleaned.is_empty() {
+        None
+    } else {
+        Some(cleaned.chars().take(72).collect())
+    }
+}
+
+fn navigate_command_history(
+    current_input: &str,
+    history: &[String],
+    cursor: &mut Option<usize>,
+    draft: &mut String,
+    direction: HistoryDirection,
+) -> Option<String> {
+    if history.is_empty() {
+        return None;
+    }
+
+    match direction {
+        HistoryDirection::Previous => {
+            let next_index = match *cursor {
+                Some(index) => (index + 1).min(history.len() - 1),
+                None => {
+                    *draft = current_input.to_owned();
+                    0
+                }
+            };
+            *cursor = Some(next_index);
+            history.get(next_index).cloned()
+        }
+        HistoryDirection::Next => {
+            let Some(index) = *cursor else {
+                return None;
+            };
+            if index == 0 {
+                *cursor = None;
+                Some(std::mem::take(draft))
+            } else {
+                let next_index = index - 1;
+                *cursor = Some(next_index);
+                history.get(next_index).cloned()
+            }
+        }
+    }
+}
+
 fn command_suggestion(
     input: &str,
     history: &[String],
     available_commands: &[String],
     shell_directory: &str,
+    commit_message: Option<&str>,
 ) -> Option<CommandSuggestion> {
     let trimmed_start = input.trim_start();
     if trimmed_start.is_empty() {
         return None;
+    }
+
+    if let (Some(template), Some(commit_message)) =
+        (commit_message_template(trimmed_start), commit_message)
+    {
+        return Some(CommandSuggestion {
+            completion: template.complete(commit_message),
+        });
     }
 
     if "/agent".starts_with(trimmed_start) && trimmed_start != "/agent" {
@@ -3557,6 +3997,11 @@ fn highlight_diff_patch(text: &str) -> LayoutJob {
     syntect_code_job(text, Some("diff"), color(222, 225, 230))
 }
 
+fn highlight_code_file(text: &str, path: &str) -> LayoutJob {
+    let extension = Path::new(path).extension().and_then(|ext| ext.to_str());
+    syntect_code_job(text, extension, color(222, 225, 230))
+}
+
 fn syntect_code_job(text: &str, syntax_hint: Option<&str>, fallback_color: Color32) -> LayoutJob {
     let mut job = LayoutJob::default();
     let default = TextFormat {
@@ -3917,22 +4362,26 @@ fn stream_reader<R: std::io::Read + Send + 'static>(
     let _ = stream_tx.send(CommandStreamMessage::Closed);
 }
 
-fn drain_command_results(command_executor: &CommandExecutor, entries: &mut [TranscriptEntry]) {
+fn drain_command_results_for_tabs(command_executor: &CommandExecutor, tabs: &mut [SearchTab]) {
     let mut blocks = Vec::new();
-    for entry in entries.iter() {
-        if let TranscriptEntry::Command(block) = entry {
-            blocks.push(block.clone());
+    for tab in tabs.iter() {
+        for entry in &tab.transcript_entries {
+            if let TranscriptEntry::Command(block) = entry {
+                blocks.push(block.clone());
+            }
         }
     }
 
     command_executor.drain_results(&mut blocks);
 
     for updated_block in blocks {
-        for entry in entries.iter_mut() {
-            if let TranscriptEntry::Command(block) = entry {
-                if block.id == updated_block.id {
-                    *block = updated_block.clone();
-                    break;
+        'tabs: for tab in tabs.iter_mut() {
+            for entry in &mut tab.transcript_entries {
+                if let TranscriptEntry::Command(block) = entry {
+                    if block.id == updated_block.id {
+                        *block = updated_block.clone();
+                        break 'tabs;
+                    }
                 }
             }
         }
@@ -3943,6 +4392,8 @@ fn execute_agent_request(request: &AgentChatRequest) -> AgentChatResult {
     if request.prompt.trim().is_empty() {
         return AgentChatResult {
             id: request.id,
+            tab_id: request.tab_id,
+            working_directory: request.working_directory.clone(),
             response: "Usage: /agent <prompt>".to_owned(),
             success: false,
             mode: request.mode,
@@ -3955,6 +4406,8 @@ fn execute_agent_request(request: &AgentChatRequest) -> AgentChatResult {
         _ => {
             return AgentChatResult {
                 id: request.id,
+                tab_id: request.tab_id,
+                working_directory: request.working_directory.clone(),
                 response: format!(
                     "Missing Groq API key. Add {} to {} or set {}.",
                     GROQ_API_KEY_ENV, LOCAL_ENV_FILE, GROQ_API_KEY_ENV
@@ -3971,6 +4424,8 @@ fn execute_agent_request(request: &AgentChatRequest) -> AgentChatResult {
         Err(error) => {
             return AgentChatResult {
                 id: request.id,
+                tab_id: request.tab_id,
+                working_directory: request.working_directory.clone(),
                 response: format!("Unable to create the Groq HTTP client: {error}"),
                 success: false,
                 mode: request.mode,
@@ -3982,6 +4437,7 @@ fn execute_agent_request(request: &AgentChatRequest) -> AgentChatResult {
     let system_prompt = match request.mode {
         AgentRequestMode::Chat => AGENT_SYSTEM_PROMPT,
         AgentRequestMode::Command => AGENT_COMMAND_SYSTEM_PROMPT,
+        AgentRequestMode::CommitMessage => COMMIT_MESSAGE_SYSTEM_PROMPT,
     };
 
     let mut messages = vec![
@@ -4034,6 +4490,8 @@ fn execute_agent_request(request: &AgentChatRequest) -> AgentChatResult {
                         .unwrap_or_else(|_| "Unknown error".to_owned());
                     return AgentChatResult {
                         id: request.id,
+                        tab_id: request.tab_id,
+                        working_directory: request.working_directory.clone(),
                         response: friendly_groq_error(status.as_u16(), &error_text),
                         success: false,
                         mode: request.mode,
@@ -4047,6 +4505,8 @@ fn execute_agent_request(request: &AgentChatRequest) -> AgentChatResult {
                         None => {
                             return AgentChatResult {
                                 id: request.id,
+                                tab_id: request.tab_id,
+                                working_directory: request.working_directory.clone(),
                                 response: "Groq returned an empty response.".to_owned(),
                                 success: false,
                                 mode: request.mode,
@@ -4057,6 +4517,8 @@ fn execute_agent_request(request: &AgentChatRequest) -> AgentChatResult {
                     Err(error) => {
                         return AgentChatResult {
                             id: request.id,
+                            tab_id: request.tab_id,
+                            working_directory: request.working_directory.clone(),
                             response: format!("Unable to decode the Groq response: {error}"),
                             success: false,
                             mode: request.mode,
@@ -4068,6 +4530,8 @@ fn execute_agent_request(request: &AgentChatRequest) -> AgentChatResult {
             Err(error) => {
                 return AgentChatResult {
                     id: request.id,
+                    tab_id: request.tab_id,
+                    working_directory: request.working_directory.clone(),
                     response: format!("Unable to reach Groq: {error}"),
                     success: false,
                     mode: request.mode,
@@ -4095,12 +4559,25 @@ fn execute_agent_request(request: &AgentChatRequest) -> AgentChatResult {
             let generated_command = extract_generated_command(&content_text);
             return AgentChatResult {
                 id: request.id,
+                tab_id: request.tab_id,
+                working_directory: request.working_directory.clone(),
                 response: generated_command.clone().unwrap_or_else(|| {
                     format!("The AI did not return a runnable command: {content_text}")
                 }),
                 success: generated_command.is_some(),
                 mode: request.mode,
                 generated_command,
+            };
+        }
+        if request.mode == AgentRequestMode::CommitMessage {
+            return AgentChatResult {
+                id: request.id,
+                tab_id: request.tab_id,
+                working_directory: request.working_directory.clone(),
+                response: content_text,
+                success: true,
+                mode: request.mode,
+                generated_command: None,
             };
         }
 
@@ -4126,6 +4603,8 @@ fn execute_agent_request(request: &AgentChatRequest) -> AgentChatResult {
 
         return AgentChatResult {
             id: request.id,
+            tab_id: request.tab_id,
+            working_directory: request.working_directory.clone(),
             response: content_text,
             success: true,
             mode: request.mode,
@@ -4135,6 +4614,8 @@ fn execute_agent_request(request: &AgentChatRequest) -> AgentChatResult {
 
     AgentChatResult {
         id: request.id,
+        tab_id: request.tab_id,
+        working_directory: request.working_directory.clone(),
         response: "The agent used too many tool steps without reaching a final answer.".to_owned(),
         success: false,
         mode: request.mode,
@@ -4804,20 +5285,24 @@ struct GroqToolFunctionCall {
 fn load_tabs_from_workspace() -> Vec<SearchTab> {
     let current = current_directory_label();
     vec![SearchTab {
+        id: 1,
         title: tab_title_from_value("", &current),
         branch: read_branch_for_directory(&current),
         directory: current,
         icon: default_tab_icon(),
+        transcript_entries: Vec::new(),
     }]
 }
 
-fn default_new_tab(existing_tabs: &[SearchTab]) -> SearchTab {
+fn default_new_tab(existing_tabs: &[SearchTab], id: u64) -> SearchTab {
     let directory = current_directory_label();
     SearchTab {
+        id,
         title: unique_tab_title(existing_tabs, "New tab"),
         branch: read_branch_for_directory(&directory),
         directory,
         icon: default_tab_icon(),
+        transcript_entries: Vec::new(),
     }
 }
 
@@ -5108,6 +5593,69 @@ fn tab_card(ui: &mut egui::Ui, tab: &SearchTab, selected: bool) -> TabCardOutput
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FilePreviewAction {
+    None,
+    Changed,
+    Save,
+}
+
+fn render_file_preview(ui: &mut egui::Ui, editor: &mut FileEditorState) -> FilePreviewAction {
+    let mut action = FilePreviewAction::None;
+    let path = editor.path.as_str();
+    ui.set_min_height(ui.available_height());
+
+    if let Some(error) = editor.error.as_deref() {
+        ui.add_space(14.0);
+        ui.label(RichText::new(error).size(13.0).color(color(239, 177, 177)));
+        return action;
+    }
+
+    let mut layouter = |ui: &egui::Ui, text: &dyn TextBuffer, wrap_width: f32| {
+        let mut job = highlight_code_file(text.as_str(), path);
+        job.wrap.max_width = wrap_width;
+        ui.ctx().fonts_mut(|fonts| fonts.layout_job(job))
+    };
+    let available = ui.available_size_before_wrap();
+    let response = ui.add_sized(
+        available,
+        TextEdit::multiline(&mut editor.contents)
+            .font(eframe::egui::TextStyle::Monospace)
+            .desired_width(f32::INFINITY)
+            .layouter(&mut layouter)
+            .margin(Vec2::new(12.0, 12.0))
+            .frame(Frame::NONE),
+    );
+    if response.changed() {
+        action = FilePreviewAction::Changed;
+    }
+    if response.has_focus()
+        && ui.input_mut(|input| input.consume_key(egui::Modifiers::CTRL, egui::Key::S))
+    {
+        action = FilePreviewAction::Save;
+    }
+    action
+}
+
+fn load_file_preview_contents(path: &Path) -> Result<String, String> {
+    let metadata = fs::metadata(path).map_err(|error| format!("Unable to read file: {error}"))?;
+    if !metadata.is_file() {
+        return Err("This path is not a file.".to_owned());
+    }
+    const MAX_PREVIEW_BYTES: u64 = 1_000_000;
+    if metadata.len() > MAX_PREVIEW_BYTES {
+        return Err(format!(
+            "File is too large to preview safely ({} KB).",
+            metadata.len() / 1024
+        ));
+    }
+    let bytes = fs::read(path).map_err(|error| format!("Unable to open file: {error}"))?;
+    if bytes.iter().take(4096).any(|byte| *byte == 0) {
+        return Err("Binary file preview is not supported yet.".to_owned());
+    }
+    String::from_utf8(bytes).map_err(|_| "File is not valid UTF-8 text.".to_owned())
+}
+
 #[derive(Clone)]
 struct FileExplorerEntry {
     path: PathBuf,
@@ -5211,11 +5759,7 @@ fn render_file_explorer_entry(
         egui::pos2(rect.left() + 8.0 + indent, rect.center().y - 6.0),
         Vec2::new(14.0, 12.0),
     );
-    if entry.is_dir {
-        paint_file_explorer_folder_icon(ui.painter(), icon_rect, expanded);
-    } else {
-        paint_file_explorer_file_icon(ui.painter(), icon_rect);
-    }
+    paint_file_type_icon(ui.painter(), icon_rect, &entry.name, entry.is_dir, expanded);
     ui.painter().text(
         egui::pos2(icon_rect.right() + 8.0, rect.center().y),
         Align2::LEFT_CENTER,
@@ -5232,7 +5776,11 @@ fn render_file_explorer_entry(
                 expanded_dirs.insert(path_key.clone());
             }
         } else {
-            *selected_file_path = Some(path_key.clone());
+            if selected {
+                *selected_file_path = None;
+            } else {
+                *selected_file_path = Some(path_key.clone());
+            }
         }
     }
 
@@ -5247,12 +5795,28 @@ fn render_file_explorer_entry(
     }
 }
 
+fn paint_file_type_icon(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    name: &str,
+    is_dir: bool,
+    expanded: bool,
+) {
+    if is_dir {
+        paint_file_explorer_folder_icon(painter, rect, expanded);
+    } else {
+        paint_file_explorer_file_icon(painter, rect, name);
+    }
+}
+
 fn paint_file_explorer_folder_icon(painter: &egui::Painter, rect: egui::Rect, expanded: bool) {
     let fill = if expanded {
-        color(142, 147, 158)
+        color(245, 194, 107)
     } else {
-        color(112, 117, 128)
+        color(219, 165, 73)
     };
+    let shadow = rect.translate(Vec2::new(0.0, 1.0));
+    painter.rect_filled(shadow, CornerRadius::same(3), color(67, 51, 27));
     let tab_rect = egui::Rect::from_min_max(
         rect.min + Vec2::new(1.0, 1.0),
         egui::pos2(rect.left() + rect.width() * 0.52, rect.top() + 5.0),
@@ -5263,21 +5827,33 @@ fn paint_file_explorer_folder_icon(painter: &egui::Painter, rect: egui::Rect, ex
     );
     painter.rect_filled(tab_rect, CornerRadius::same(2), fill);
     painter.rect_filled(body_rect, CornerRadius::same(3), fill);
+    painter.rect_stroke(
+        body_rect,
+        CornerRadius::same(3),
+        Stroke::new(0.8, color(255, 218, 144)),
+        StrokeKind::Outside,
+    );
 }
 
-fn paint_file_explorer_file_icon(painter: &egui::Painter, rect: egui::Rect) {
-    let stroke = Stroke::new(1.15, color(124, 129, 140));
+fn paint_file_explorer_file_icon(painter: &egui::Painter, rect: egui::Rect, name: &str) {
+    let (accent, label) = file_icon_style(name);
+    let stroke = Stroke::new(1.0, color(120, 126, 139));
     let page_rect = egui::Rect::from_min_max(
-        rect.min + Vec2::new(3.0, 1.0),
-        egui::pos2(rect.right() - 2.0, rect.bottom() - 1.0),
+        rect.min + Vec2::new(2.0, 0.0),
+        egui::pos2(rect.right() - 1.0, rect.bottom()),
     );
-    painter.rect(
+    painter.rect_filled(page_rect, CornerRadius::same(2), color(22, 24, 30));
+    painter.rect_stroke(
         page_rect,
         CornerRadius::same(2),
-        Color32::TRANSPARENT,
         stroke,
         StrokeKind::Outside,
     );
+    let stripe = egui::Rect::from_min_max(
+        egui::pos2(page_rect.left(), page_rect.bottom() - 3.0),
+        page_rect.right_bottom(),
+    );
+    painter.rect_filled(stripe, CornerRadius::same(1), accent);
     let fold = [
         egui::pos2(page_rect.right() - 4.0, page_rect.top()),
         egui::pos2(page_rect.right(), page_rect.top() + 4.0),
@@ -5285,6 +5861,35 @@ fn paint_file_explorer_file_icon(painter: &egui::Painter, rect: egui::Rect) {
     ];
     painter.line_segment([fold[0], fold[1]], stroke);
     painter.line_segment([fold[1], fold[2]], stroke);
+    if let Some(label) = label {
+        painter.text(
+            page_rect.center() - Vec2::new(0.0, 0.5),
+            Align2::CENTER_CENTER,
+            label,
+            FontId::new(6.5, FontFamily::Monospace),
+            color(231, 235, 244),
+        );
+    }
+}
+
+fn file_icon_style(name: &str) -> (Color32, Option<&'static str>) {
+    match Path::new(name).extension().and_then(|ext| ext.to_str()) {
+        Some("rs") => (color(222, 117, 69), Some("RS")),
+        Some("js") | Some("jsx") => (color(240, 219, 79), Some("JS")),
+        Some("ts") | Some("tsx") => (color(49, 120, 198), Some("TS")),
+        Some("py") => (color(76, 139, 203), Some("PY")),
+        Some("json") => (color(245, 188, 66), Some("{}")),
+        Some("toml") => (color(154, 110, 82), Some("TM")),
+        Some("md") => (color(116, 168, 255), Some("MD")),
+        Some("html") => (color(232, 98, 53), Some("<>")),
+        Some("css") => (color(86, 142, 222), Some("#")),
+        Some("yml") | Some("yaml") => (color(205, 106, 132), Some("Y")),
+        Some("ico") | Some("png") | Some("jpg") | Some("jpeg") | Some("webp") => {
+            (color(121, 202, 151), Some("IM"))
+        }
+        Some("exe") | Some("msi") | Some("dmg") => (color(178, 137, 235), Some("PK")),
+        _ => (color(111, 117, 130), None),
+    }
 }
 
 fn read_file_explorer_entries(directory: &Path) -> std::io::Result<Vec<FileExplorerEntry>> {
