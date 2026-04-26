@@ -41,7 +41,6 @@ cargo build --release
 
 GitHub Actions builds downloadable release artifacts for macOS and Windows:
 
-- `velocity-macos-intel`
 - `velocity-macos-apple-silicon`
 - `velocity-windows`
 
