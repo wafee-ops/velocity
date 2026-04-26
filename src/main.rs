@@ -19,6 +19,7 @@ use eframe::egui::{
 };
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 use shadow_terminal::{
     shadow_terminal::Config as ShadowConfig,
     steppable_terminal::{Input as TerminalInput, SteppableTerminal},
@@ -202,8 +203,10 @@ const GROQ_API_KEY_ENV: &str = "GROQ_API_KEY";
 const LOCAL_ENV_FILE: &str = ".env.local";
 const AGENT_SYSTEM_PROMPT: &str = "You are an action-oriented coding agent inside a desktop app. \
 You can use local tools when needed. \
-When you want to use a tool, respond with only valid JSON. \
-Do not wrap the JSON in code fences. Do not add commentary before or after it. \
+Use the provided tools when you need local context or need to change files. \
+Do not call built-in tools such as repobrowser.* or browser.*. \
+If native tool calling is unavailable and you want to use a tool, respond with only valid JSON. \
+Do not wrap fallback JSON in code fences. Do not add commentary before or after it. \
 Available tools: \
 1. shell: runs a shell command in the current working directory and returns stdout/stderr. \
 2. read_file: reads a UTF-8 text file relative to the current working directory. \
@@ -502,6 +505,8 @@ struct VelocityApp {
     refocus_terminal_input: Option<usize>,
     branch_picker_open: bool,
     pending_branch_refresh_command_id: Option<u64>,
+    expanded_file_dirs: BTreeSet<String>,
+    selected_file_path: Option<String>,
 }
 
 struct InputContext {
@@ -542,6 +547,8 @@ impl VelocityApp {
             refocus_terminal_input: None,
             branch_picker_open: false,
             pending_branch_refresh_command_id: None,
+            expanded_file_dirs: BTreeSet::from([shell_directory.clone()]),
+            selected_file_path: None,
         }
     }
 
@@ -1010,9 +1017,11 @@ impl VelocityApp {
                         .color(color(132, 136, 145)),
                     );
 
+                    let tab_list_height = ui.available_height().max(120.0);
                     ScrollArea::vertical()
                         .id_salt("search_sidebar_tabs_scroll")
                         .auto_shrink([false, false])
+                        .max_height(tab_list_height)
                         .show(ui, |ui| {
                             ui.spacing_mut().item_spacing = Vec2::ZERO;
 
@@ -1034,6 +1043,45 @@ impl VelocityApp {
                             }
                         });
                 });
+            });
+    }
+
+    fn render_file_explorer_sidebar(&mut self, ui: &mut egui::Ui) {
+        Frame::new()
+            .fill(color(20, 21, 24))
+            .inner_margin(Margin::same(8))
+            .stroke(Stroke::new(1.0, color(43, 43, 43)))
+            .show(ui, |ui| {
+                ui.set_min_height(ui.available_height());
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new("Files")
+                            .size(11.0)
+                            .color(color(132, 136, 145)),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(
+                            RichText::new(short_directory_name(&self.shell_directory))
+                                .size(10.0)
+                                .color(color(104, 108, 118)),
+                        )
+                        .on_hover_text(&self.shell_directory);
+                    });
+                });
+                ui.add_space(8.0);
+
+                let root = self.shell_directory.clone();
+                ScrollArea::vertical()
+                    .id_salt("file_explorer_scroll")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        render_file_explorer(
+                            ui,
+                            &root,
+                            &mut self.expanded_file_dirs,
+                            &mut self.selected_file_path,
+                        );
+                    });
             });
     }
 }
@@ -1112,10 +1160,18 @@ impl eframe::App for VelocityApp {
                     } else {
                         0.0
                     };
+                    let file_sidebar_width = (root_rect.width() * 0.18).clamp(220.0, 300.0);
 
                     let sidebar_rect = egui::Rect::from_min_max(
                         root_rect.min,
                         egui::pos2(root_rect.left() + sidebar_width, root_rect.bottom()),
+                    );
+                    let file_sidebar_rect = egui::Rect::from_min_max(
+                        egui::pos2(sidebar_rect.right() + divider, root_rect.top()),
+                        egui::pos2(
+                            sidebar_rect.right() + divider + file_sidebar_width,
+                            root_rect.bottom(),
+                        ),
                     );
                     let diff_rect = if self.diff_navigation_open {
                         Some(egui::Rect::from_min_max(
@@ -1125,7 +1181,7 @@ impl eframe::App for VelocityApp {
                     } else {
                         None
                     };
-                    let center_left = sidebar_rect.right() + divider;
+                    let center_left = file_sidebar_rect.right() + divider;
                     let center_right = diff_rect
                         .map(|rect| rect.left() - divider)
                         .unwrap_or(root_rect.right());
@@ -1150,6 +1206,9 @@ impl eframe::App for VelocityApp {
 
                     ui.scope_builder(egui::UiBuilder::new().max_rect(sidebar_rect), |ui| {
                         self.render_search_sidebar(ui)
+                    });
+                    ui.scope_builder(egui::UiBuilder::new().max_rect(file_sidebar_rect), |ui| {
+                        self.render_file_explorer_sidebar(ui)
                     });
 
                     ui.scope_builder(egui::UiBuilder::new().max_rect(transcript_rect), |ui| {
@@ -2061,13 +2120,26 @@ fn paint_command_context_boxes(
 }
 
 fn paint_branch_badge_icon(painter: &egui::Painter, rect: egui::Rect, color: Color32) {
-    painter.text(
-        rect.center(),
-        Align2::CENTER_CENTER,
-        "\u{e0a0}",
-        FontId::new(rect.height() * 1.15, FontFamily::Monospace),
-        color,
+    let stroke = Stroke::new(1.35, color);
+    let radius = (rect.width().min(rect.height()) * 0.16).clamp(1.5, 2.0);
+    let main_x = rect.left() + rect.width() * 0.28;
+    let branch_x = rect.right() - rect.width() * 0.22;
+    let top = egui::pos2(main_x, rect.top() + rect.height() * 0.2);
+    let bottom = egui::pos2(main_x, rect.bottom() - rect.height() * 0.2);
+    let branch = egui::pos2(branch_x, rect.top() + rect.height() * 0.38);
+    let junction = egui::pos2(main_x, rect.center().y);
+
+    painter.line_segment(
+        [
+            top + Vec2::new(0.0, radius),
+            bottom - Vec2::new(0.0, radius),
+        ],
+        stroke,
     );
+    painter.line_segment([junction, egui::pos2(branch.x - radius, branch.y)], stroke);
+    painter.circle_stroke(top, radius, stroke);
+    painter.circle_stroke(bottom, radius, stroke);
+    painter.circle_stroke(branch, radius, stroke);
 }
 
 struct BranchPickerOutput {
@@ -3915,21 +3987,36 @@ fn execute_agent_request(request: &AgentChatRequest) -> AgentChatResult {
     let mut messages = vec![
         GroqMessage {
             role: "system".to_owned(),
-            content: system_prompt.to_owned(),
+            content: Some(system_prompt.to_owned()),
+            tool_call_id: None,
+            tool_calls: None,
         },
         GroqMessage {
             role: "user".to_owned(),
-            content: format!(
+            content: Some(format!(
                 "Current working directory: {}\n\nUser request:\n{}",
                 request.working_directory, request.prompt
-            ),
+            )),
+            tool_call_id: None,
+            tool_calls: None,
         },
     ];
 
     for _ in 0..4 {
+        let tools = if request.mode == AgentRequestMode::Chat {
+            Some(groq_agent_tools())
+        } else {
+            None
+        };
         let payload = GroqChatRequest {
             model: GROQ_MODEL.to_owned(),
             messages: messages.clone(),
+            tools,
+            tool_choice: if request.mode == AgentRequestMode::Chat {
+                Some("auto".to_owned())
+            } else {
+                None
+            },
         };
 
         let response = client
@@ -3947,7 +4034,7 @@ fn execute_agent_request(request: &AgentChatRequest) -> AgentChatResult {
                         .unwrap_or_else(|_| "Unknown error".to_owned());
                     return AgentChatResult {
                         id: request.id,
-                        response: format!("Groq request failed with {}: {}", status, error_text),
+                        response: friendly_groq_error(status.as_u16(), &error_text),
                         success: false,
                         mode: request.mode,
                         generated_command: None,
@@ -3955,13 +4042,18 @@ fn execute_agent_request(request: &AgentChatRequest) -> AgentChatResult {
                 }
 
                 match response.json::<GroqChatResponse>() {
-                    Ok(body) => body
-                        .choices
-                        .into_iter()
-                        .next()
-                        .map(|choice| choice.message.content.trim().to_owned())
-                        .filter(|content| !content.is_empty())
-                        .unwrap_or_else(|| "Groq returned an empty response.".to_owned()),
+                    Ok(body) => match body.choices.into_iter().next() {
+                        Some(choice) => choice.message,
+                        None => {
+                            return AgentChatResult {
+                                id: request.id,
+                                response: "Groq returned an empty response.".to_owned(),
+                                success: false,
+                                mode: request.mode,
+                                generated_command: None,
+                            };
+                        }
+                    },
                     Err(error) => {
                         return AgentChatResult {
                             id: request.id,
@@ -3984,12 +4076,27 @@ fn execute_agent_request(request: &AgentChatRequest) -> AgentChatResult {
             }
         };
 
+        if let Some(tool_calls) = content.tool_calls.clone() {
+            messages.push(content.clone());
+            for tool_call in tool_calls {
+                let tool_result = run_groq_tool_call(&request.working_directory, &tool_call);
+                messages.push(GroqMessage {
+                    role: "tool".to_owned(),
+                    content: Some(tool_result),
+                    tool_call_id: Some(tool_call.id),
+                    tool_calls: None,
+                });
+            }
+            continue;
+        }
+
+        let content_text = content.content.unwrap_or_default().trim().to_owned();
         if request.mode == AgentRequestMode::Command {
-            let generated_command = extract_generated_command(&content);
+            let generated_command = extract_generated_command(&content_text);
             return AgentChatResult {
                 id: request.id,
                 response: generated_command.clone().unwrap_or_else(|| {
-                    format!("The AI did not return a runnable command: {content}")
+                    format!("The AI did not return a runnable command: {content_text}")
                 }),
                 success: generated_command.is_some(),
                 mode: request.mode,
@@ -3997,25 +4104,29 @@ fn execute_agent_request(request: &AgentChatRequest) -> AgentChatResult {
             };
         }
 
-        if let Some(tool_call) = parse_agent_tool_call(&content) {
+        if let Some(tool_call) = parse_agent_tool_call(&content_text) {
             let tool_result = run_agent_tool(&request.working_directory, tool_call);
             messages.push(GroqMessage {
                 role: "assistant".to_owned(),
-                content,
+                content: Some(content_text),
+                tool_call_id: None,
+                tool_calls: None,
             });
             messages.push(GroqMessage {
                 role: "user".to_owned(),
-                content: format!(
+                content: Some(format!(
                     "Tool result:\n```text\n{}\n```\nIf you have enough information, answer normally in Markdown. Otherwise emit another JSON tool call.",
                     tool_result.trim_end()
-                ),
+                )),
+                tool_call_id: None,
+                tool_calls: None,
             });
             continue;
         }
 
         return AgentChatResult {
             id: request.id,
-            response: content,
+            response: content_text,
             success: true,
             mode: request.mode,
             generated_command: None,
@@ -4029,6 +4140,219 @@ fn execute_agent_request(request: &AgentChatRequest) -> AgentChatResult {
         mode: request.mode,
         generated_command: None,
     }
+}
+
+fn friendly_groq_error(status: u16, error_text: &str) -> String {
+    if error_text.contains("tool_use_failed")
+        || error_text.contains("Tool choice is none")
+        || error_text.contains("model called a tool")
+    {
+        return "The agent tried to use a tool before Groq accepted the tool setup. Please try again; this build now sends the available tools explicitly.".to_owned();
+    }
+    format!("Groq request failed with {status}: {error_text}")
+}
+
+fn groq_agent_tools() -> Vec<Value> {
+    vec![
+        json!({
+            "type": "function",
+            "function": {
+                "name": "shell",
+                "description": "Run a shell command in the current working directory and return stdout/stderr.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "command": { "type": "string" }
+                    },
+                    "required": ["command"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "description": "Read a UTF-8 text file relative to the current working directory.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string" }
+                    },
+                    "required": ["path"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "write_file",
+                "description": "Replace a UTF-8 text file with provided content.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string" },
+                        "content": { "type": "string" }
+                    },
+                    "required": ["path", "content"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "append_file",
+                "description": "Append UTF-8 text to a file.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string" },
+                        "content": { "type": "string" }
+                    },
+                    "required": ["path", "content"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "replace_in_file",
+                "description": "Replace one exact substring in a file with another string.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string" },
+                        "from": { "type": "string" },
+                        "to": { "type": "string" }
+                    },
+                    "required": ["path", "from", "to"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "list_dir",
+                "description": "List files and folders in a directory relative to the current working directory.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string" }
+                    }
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "mkdir",
+                "description": "Create a directory recursively.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string" }
+                    },
+                    "required": ["path"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "rename_path",
+                "description": "Rename or move a file or folder.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string" },
+                        "new_path": { "type": "string" }
+                    },
+                    "required": ["path", "new_path"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "delete_path",
+                "description": "Delete a file or folder recursively.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string" }
+                    },
+                    "required": ["path"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "file_info",
+                "description": "Return metadata for a path.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string" }
+                    },
+                    "required": ["path"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "git_status",
+                "description": "Return git status for the current working directory.",
+                "parameters": { "type": "object", "properties": {} }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "git_diff",
+                "description": "Return git diff, optionally for a specific file.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string" }
+                    }
+                }
+            }
+        }),
+    ]
+}
+
+fn run_groq_tool_call(working_directory: &str, tool_call: &GroqToolCall) -> String {
+    if tool_call.kind != "function" {
+        return format!(
+            "Tool error: unsupported tool call type `{}`.",
+            tool_call.kind
+        );
+    }
+    match agent_tool_call_from_function(&tool_call.function.name, &tool_call.function.arguments) {
+        Ok(call) => run_agent_tool(working_directory, call),
+        Err(error) => error,
+    }
+}
+
+fn agent_tool_call_from_function(name: &str, arguments: &str) -> Result<AgentToolCall, String> {
+    let value = if arguments.trim().is_empty() {
+        Value::Object(Default::default())
+    } else {
+        serde_json::from_str::<Value>(arguments)
+            .map_err(|error| format!("Tool error: invalid tool arguments: {error}"))?
+    };
+    let field = |key: &str| value.get(key).and_then(Value::as_str).map(str::to_owned);
+    let tool = name.rsplit('.').next().unwrap_or(name).to_owned();
+    Ok(AgentToolCall {
+        tool,
+        command: field("command"),
+        path: field("path"),
+        new_path: field("new_path"),
+        content: field("content"),
+        from: field("from"),
+        to: field("to"),
+    })
 }
 
 #[derive(Deserialize)]
@@ -4436,12 +4760,21 @@ fn load_key_from_local_env_file(path: &str, key: &str) -> Option<String> {
 struct GroqChatRequest {
     model: String,
     messages: Vec<GroqMessage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<Vec<Value>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_choice: Option<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
 struct GroqMessage {
     role: String,
-    content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_call_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_calls: Option<Vec<GroqToolCall>>,
 }
 
 #[derive(Deserialize)]
@@ -4452,6 +4785,20 @@ struct GroqChatResponse {
 #[derive(Deserialize)]
 struct GroqChoice {
     message: GroqMessage,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct GroqToolCall {
+    id: String,
+    #[serde(rename = "type")]
+    kind: String,
+    function: GroqToolFunctionCall,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct GroqToolFunctionCall {
+    name: String,
+    arguments: String,
 }
 
 fn load_tabs_from_workspace() -> Vec<SearchTab> {
@@ -4732,7 +5079,7 @@ fn tab_card(ui: &mut egui::Ui, tab: &SearchTab, selected: bool) -> TabCardOutput
         card_rect.min + Vec2::new(34.0 + title_width + 8.0, 7.0),
         Vec2::new(12.0, 12.0),
     );
-    paint_branch_badge_icon(ui.painter(), git_badge_rect, color(232, 234, 237));
+    paint_branch_badge_icon(ui.painter(), git_badge_rect, color(255, 208, 102));
     ui.painter().text(
         card_rect.min + Vec2::new(34.0 + title_width + 22.0, 6.0),
         Align2::LEFT_TOP,
@@ -4759,6 +5106,244 @@ fn tab_card(ui: &mut egui::Ui, tab: &SearchTab, selected: bool) -> TabCardOutput
         response: response.on_hover_text(display_tab_path(&tab.directory)),
         close_clicked: close_response.clicked(),
     }
+}
+
+#[derive(Clone)]
+struct FileExplorerEntry {
+    path: PathBuf,
+    name: String,
+    is_dir: bool,
+}
+
+fn render_file_explorer(
+    ui: &mut egui::Ui,
+    root: &str,
+    expanded_dirs: &mut BTreeSet<String>,
+    selected_file_path: &mut Option<String>,
+) {
+    let root_path = PathBuf::from(root);
+    if !root_path.exists() {
+        ui.add_space(8.0);
+        ui.label(
+            RichText::new("Directory not found")
+                .size(12.0)
+                .color(color(159, 166, 178)),
+        );
+        return;
+    }
+
+    render_file_explorer_children(ui, &root_path, 0, expanded_dirs, selected_file_path);
+}
+
+fn render_file_explorer_children(
+    ui: &mut egui::Ui,
+    directory: &Path,
+    depth: usize,
+    expanded_dirs: &mut BTreeSet<String>,
+    selected_file_path: &mut Option<String>,
+) {
+    let entries = match read_file_explorer_entries(directory) {
+        Ok(entries) => entries,
+        Err(_) => {
+            ui.horizontal(|ui| {
+                ui.add_space(depth as f32 * 12.0);
+                ui.label(
+                    RichText::new("Unable to read folder")
+                        .size(12.0)
+                        .color(color(159, 166, 178)),
+                );
+            });
+            return;
+        }
+    };
+
+    if entries.is_empty() {
+        ui.horizontal(|ui| {
+            ui.add_space(depth as f32 * 12.0);
+            ui.label(
+                RichText::new("Empty folder")
+                    .size(12.0)
+                    .color(color(104, 108, 118)),
+            );
+        });
+        return;
+    }
+
+    for entry in entries {
+        render_file_explorer_entry(ui, entry, depth, expanded_dirs, selected_file_path);
+    }
+}
+
+fn render_file_explorer_entry(
+    ui: &mut egui::Ui,
+    entry: FileExplorerEntry,
+    depth: usize,
+    expanded_dirs: &mut BTreeSet<String>,
+    selected_file_path: &mut Option<String>,
+) {
+    let path_key = normalize_display_path(&entry.path);
+    let expanded = entry.is_dir && expanded_dirs.contains(&path_key);
+    let selected = selected_file_path.as_deref() == Some(path_key.as_str());
+    let row_height = 24.0;
+    let (rect, response) = ui.allocate_exact_size(
+        Vec2::new(ui.available_width(), row_height),
+        egui::Sense::click(),
+    );
+
+    let bg = if selected {
+        color(47, 59, 82)
+    } else if response.hovered() {
+        color(35, 37, 43)
+    } else {
+        Color32::TRANSPARENT
+    };
+    if bg != Color32::TRANSPARENT {
+        ui.painter().rect_filled(rect, CornerRadius::same(6), bg);
+    }
+
+    let indent = depth as f32 * 14.0;
+    let text_color = if entry.is_dir {
+        color(224, 228, 238)
+    } else {
+        color(190, 195, 207)
+    };
+    let icon_rect = egui::Rect::from_min_size(
+        egui::pos2(rect.left() + 8.0 + indent, rect.center().y - 6.0),
+        Vec2::new(14.0, 12.0),
+    );
+    if entry.is_dir {
+        paint_file_explorer_folder_icon(ui.painter(), icon_rect, expanded);
+    } else {
+        paint_file_explorer_file_icon(ui.painter(), icon_rect);
+    }
+    ui.painter().text(
+        egui::pos2(icon_rect.right() + 8.0, rect.center().y),
+        Align2::LEFT_CENTER,
+        truncate_middle(&entry.name, 28),
+        FontId::new(12.0, FontFamily::Proportional),
+        text_color,
+    );
+
+    if response.on_hover_text(&path_key).clicked() {
+        if entry.is_dir {
+            if expanded {
+                expanded_dirs.remove(&path_key);
+            } else {
+                expanded_dirs.insert(path_key.clone());
+            }
+        } else {
+            *selected_file_path = Some(path_key.clone());
+        }
+    }
+
+    if expanded {
+        render_file_explorer_children(
+            ui,
+            &entry.path,
+            depth + 1,
+            expanded_dirs,
+            selected_file_path,
+        );
+    }
+}
+
+fn paint_file_explorer_folder_icon(painter: &egui::Painter, rect: egui::Rect, expanded: bool) {
+    let fill = if expanded {
+        color(142, 147, 158)
+    } else {
+        color(112, 117, 128)
+    };
+    let tab_rect = egui::Rect::from_min_max(
+        rect.min + Vec2::new(1.0, 1.0),
+        egui::pos2(rect.left() + rect.width() * 0.52, rect.top() + 5.0),
+    );
+    let body_rect = egui::Rect::from_min_max(
+        egui::pos2(rect.left() + 1.0, rect.top() + 3.5),
+        egui::pos2(rect.right() - 1.0, rect.bottom() - 1.0),
+    );
+    painter.rect_filled(tab_rect, CornerRadius::same(2), fill);
+    painter.rect_filled(body_rect, CornerRadius::same(3), fill);
+}
+
+fn paint_file_explorer_file_icon(painter: &egui::Painter, rect: egui::Rect) {
+    let stroke = Stroke::new(1.15, color(124, 129, 140));
+    let page_rect = egui::Rect::from_min_max(
+        rect.min + Vec2::new(3.0, 1.0),
+        egui::pos2(rect.right() - 2.0, rect.bottom() - 1.0),
+    );
+    painter.rect(
+        page_rect,
+        CornerRadius::same(2),
+        Color32::TRANSPARENT,
+        stroke,
+        StrokeKind::Outside,
+    );
+    let fold = [
+        egui::pos2(page_rect.right() - 4.0, page_rect.top()),
+        egui::pos2(page_rect.right(), page_rect.top() + 4.0),
+        egui::pos2(page_rect.right() - 4.0, page_rect.top() + 4.0),
+    ];
+    painter.line_segment([fold[0], fold[1]], stroke);
+    painter.line_segment([fold[1], fold[2]], stroke);
+}
+
+fn read_file_explorer_entries(directory: &Path) -> std::io::Result<Vec<FileExplorerEntry>> {
+    let mut entries = Vec::new();
+    for entry in fs::read_dir(directory)?.flatten().take(250) {
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().to_string();
+        let is_dir = entry
+            .file_type()
+            .map(|file_type| file_type.is_dir())
+            .unwrap_or(false);
+        if should_hide_file_explorer_entry(&name, is_dir) {
+            continue;
+        }
+        entries.push(FileExplorerEntry { path, name, is_dir });
+    }
+    entries.sort_by(|left, right| {
+        right
+            .is_dir
+            .cmp(&left.is_dir)
+            .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
+    });
+    Ok(entries)
+}
+
+fn should_hide_file_explorer_entry(name: &str, is_dir: bool) -> bool {
+    is_dir
+        && matches!(
+            name,
+            ".git" | "target" | "node_modules" | ".next" | ".turbo" | "dist"
+        )
+}
+
+fn short_directory_name(directory: &str) -> String {
+    Path::new(directory)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty())
+        .unwrap_or(directory)
+        .to_owned()
+}
+
+fn truncate_middle(value: &str, max_chars: usize) -> String {
+    let char_count = value.chars().count();
+    if char_count <= max_chars {
+        return value.to_owned();
+    }
+    let front = max_chars.saturating_sub(3) / 2;
+    let back = max_chars.saturating_sub(3) - front;
+    let start: String = value.chars().take(front).collect();
+    let end: String = value
+        .chars()
+        .rev()
+        .take(back)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    format!("{start}...{end}")
 }
 
 fn paint_tab_icon(painter: &egui::Painter, rect: egui::Rect, icon: TabIcon) {
